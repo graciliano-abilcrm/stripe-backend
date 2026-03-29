@@ -79,7 +79,12 @@ app.get('/api/stripe/mrr', async (req, res) => {
         mrr += amount * (item.quantity || 1);
       }
     }
-    res.json({ mrr: parseFloat(mrr.toFixed(2)), count: subscriptions.length });
+    res.json({
+      mrr: parseFloat(mrr.toFixed(2)),
+      count: subscriptions.length,
+      is_current: true,
+      nota: 'MRR reflete assinaturas ativas hoje',
+    });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -182,27 +187,38 @@ app.get('/api/stripe/volume-bruto', async (req, res) => {
       .filter(c => c.status === 'succeeded')
       .reduce((sum, c) => sum + (c.amount || 0), 0) / 100;
 
+    // Volume bruto = todos os succeeded (antes de descontar reembolsos)
+    const bruto = charges
+      .filter(c => c.status === 'succeeded')
+      .reduce((sum, c) => sum + (c.amount || 0), 0) / 100;
+
+    // Concluído = succeeded menos o que foi reembolsado
     const concluido = charges
-      .filter(c => c.status === 'succeeded' && !c.amount_refunded)
-      .reduce((sum, c) => sum + (c.amount || 0), 0) / 100;
+      .filter(c => c.status === 'succeeded')
+      .reduce((sum, c) => sum + (c.amount || 0) - (c.amount_refunded || 0), 0) / 100;
 
+    // Não capturado = authorized mas captured=false (informativo, NÃO entra no bruto)
     const nao_capturado = charges
-      .filter(c => c.captured === false)
+      .filter(c => c.captured === false && c.status !== 'failed')
       .reduce((sum, c) => sum + (c.amount || 0), 0) / 100;
 
+    // Reembolsado = total devolvido
     const reembolsado = charges
-      .filter(c => c.amount_refunded > 0)
+      .filter(c => (c.amount_refunded || 0) > 0)
       .reduce((sum, c) => sum + (c.amount_refunded || 0), 0) / 100;
 
+    // Bloqueado = bloqueado pelo Radar (informativo)
     const bloqueado = charges
-      .filter(c => c.status === 'succeeded' && c.outcome?.type === 'blocked')
+      .filter(c => c.outcome?.type === 'blocked')
       .reduce((sum, c) => sum + (c.amount || 0), 0) / 100;
 
+    // Malsucedido = failed (informativo, NÃO entra no bruto)
     const malsucedido = charges
       .filter(c => c.status === 'failed')
       .reduce((sum, c) => sum + (c.amount || 0), 0) / 100;
 
-    const bruto = concluido + nao_capturado + bloqueado + malsucedido;
+    const taxas = 0;
+    const liquido = parseFloat((bruto - taxas).toFixed(2));
 
     res.json({
       bruto: parseFloat(bruto.toFixed(2)),
@@ -212,8 +228,8 @@ app.get('/api/stripe/volume-bruto', async (req, res) => {
       bloqueado: parseFloat(bloqueado.toFixed(2)),
       malsucedido: parseFloat(malsucedido.toFixed(2)),
       periodo_anterior: parseFloat(periodoAnterior.toFixed(2)),
-      taxas: 0,
-      liquido: parseFloat(bruto.toFixed(2)),
+      taxas,
+      liquido,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
