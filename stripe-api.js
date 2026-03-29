@@ -285,27 +285,82 @@ app.get('/api/stripe/clientes/top', async (req, res) => {
 app.get('/api/stripe/divisao-receita', async (req, res) => {
   try {
     const { inicio, fim } = getMesAtual();
+
+    // Buscar charges do mês
     const charges = await stripeListAll('charges', {
       'created[gte]': String(inicio),
       'created[lte]': String(fim),
     });
+
     const succeeded = charges.filter(c => c.status === 'succeeded');
+
     const assinaturas = succeeded
       .filter(c => c.invoice)
       .reduce((sum, c) => sum + (c.amount || 0) / 100, 0);
+
     const variaveis = succeeded
       .filter(c => !c.invoice)
       .reduce((sum, c) => sum + (c.amount || 0) / 100, 0);
-    const taxas = succeeded
-      .reduce((sum, c) => sum + (c.application_fee_amount || 0) / 100, 0);
+
     const bruto = assinaturas + variaveis;
+
+    // Buscar taxas reais via balance_transactions
+    const balanceTxs = await stripeListAll('balance_transactions', {
+      type: 'charge',
+      'created[gte]': String(inicio),
+      'created[lte]': String(fim),
+    });
+    const taxas = balanceTxs.reduce((sum, tx) => sum + (tx.fee || 0), 0) / 100;
+
+    // Agregar subcontas via regex na descrição
+    const subcontasMap = {};
+    for (const c of succeeded) {
+      const match = c.description?.match(/Auto-Recharge for Sub-Account - (.+?) (?:of BRL|\d)/);
+      const nome = match ? match[1].trim() : null;
+      if (!nome) continue;
+      if (!subcontasMap[nome]) subcontasMap[nome] = { nome, total: 0, count: 0 };
+      subcontasMap[nome].total += (c.amount || 0) / 100;
+      subcontasMap[nome].count += 1;
+    }
+    const subcontas = Object.values(subcontasMap)
+      .sort((a, b) => b.total - a.total)
+      .map(s => ({ nome: s.nome, total: parseFloat(s.total.toFixed(2)), count: s.count }));
+
     res.json({
       bruto: parseFloat(bruto.toFixed(2)),
       assinaturas: parseFloat(assinaturas.toFixed(2)),
       variaveis: parseFloat(variaveis.toFixed(2)),
       taxas: parseFloat(taxas.toFixed(2)),
       liquido: parseFloat((bruto - taxas).toFixed(2)),
+      subcontas,
     });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/stripe/assinaturas/recentes', async (req, res) => {
+  try {
+    const subs = await stripeListAll('subscriptions', {
+      status: 'all',
+      limit: '10',
+    });
+
+    const recentes = subs.slice(0, 10).map(sub => {
+      const item = sub.items?.data?.[0];
+      const price = item?.price;
+      const product = price?.product;
+      return {
+        id: sub.id,
+        cliente_email: sub.customer?.email || sub.metadata?.email || 'N/A',
+        cliente_nome: sub.customer?.name || sub.metadata?.name || 'N/A',
+        plano: price?.nickname || (typeof product === 'object' ? product?.name : null) || 'N/A',
+        valor: price?.unit_amount ? price.unit_amount / 100 : 0,
+        intervalo: price?.recurring?.interval || 'N/A',
+        status: sub.status,
+        data_criacao: new Date(sub.created * 1000).toLocaleDateString('pt-BR'),
+      };
+    });
+
+    res.json({ assinaturas: recentes });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
