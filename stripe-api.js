@@ -46,8 +46,14 @@ async function stripeListAll(endpoint, params = {}) {
   return all;
 }
 
-function getMesAtual() {
+function getPeriodo(req) {
   const agora = new Date();
+  if (req.query.start && req.query.end) {
+    return {
+      inicio: parseInt(req.query.start),
+      fim: parseInt(req.query.end),
+    };
+  }
   const inicio = new Date(agora.getFullYear(), agora.getMonth(), 1);
   const fim = new Date(agora.getFullYear(), agora.getMonth() + 1, 0, 23, 59, 59);
   return {
@@ -79,7 +85,7 @@ app.get('/api/stripe/mrr', async (req, res) => {
 
 app.get('/api/stripe/invoices/paid', async (req, res) => {
   try {
-    const { inicio, fim } = getMesAtual();
+    const { inicio, fim } = getPeriodo(req);
     const invoices = await stripeListAll('invoices', {
       status: 'paid',
       'created[gte]': String(inicio),
@@ -100,7 +106,7 @@ app.get('/api/stripe/invoices/open', async (req, res) => {
 
 app.get('/api/stripe/refunds', async (req, res) => {
   try {
-    const { inicio, fim } = getMesAtual();
+    const { inicio, fim } = getPeriodo(req);
     const refunds = await stripeListAll('refunds', {
       'created[gte]': String(inicio),
       'created[lte]': String(fim),
@@ -112,7 +118,7 @@ app.get('/api/stripe/refunds', async (req, res) => {
 
 app.get('/api/stripe/churn', async (req, res) => {
   try {
-    const { inicio, fim } = getMesAtual();
+    const { inicio, fim } = getPeriodo(req);
 
     // Stripe não suporta filtro por canceled_at — busca tudo e filtra manualmente
     const canceled = await stripeListAll('subscriptions', {
@@ -156,19 +162,20 @@ app.get('/health', (req, res) => {
 
 app.get('/api/stripe/volume-bruto', async (req, res) => {
   try {
-    const { inicio, fim } = getMesAtual();
+    const { inicio, fim } = getPeriodo(req);
     const charges = await stripeListAll('charges', {
       'created[gte]': String(inicio),
       'created[lte]': String(fim),
     });
 
-    // Calcular período anterior para comparação
-    const agora = new Date();
-    const inicioMesAnterior = new Date(agora.getFullYear(), agora.getMonth() - 1, 1);
-    const fimMesAnterior = new Date(agora.getFullYear(), agora.getMonth(), 0, 23, 59, 59);
+    // Calcular período anterior com mesma duração, imediatamente antes
+    const duracaoDias = Math.floor((fim - inicio) / 86400);
+    const inicioAnterior = inicio - (duracaoDias * 86400);
+    const fimAnterior = inicio - 1;
+
     const chargesAnterior = await stripeListAll('charges', {
-      'created[gte]': String(Math.floor(inicioMesAnterior.getTime() / 1000)),
-      'created[lte]': String(Math.floor(fimMesAnterior.getTime() / 1000)),
+      'created[gte]': String(inicioAnterior),
+      'created[lte]': String(fimAnterior),
     });
 
     const periodoAnterior = chargesAnterior
@@ -215,7 +222,7 @@ app.get('/api/stripe/volume-bruto', async (req, res) => {
 
 app.get('/api/stripe/pagamentos', async (req, res) => {
   try {
-    const { inicio, fim } = getMesAtual();
+    const { inicio, fim } = getPeriodo(req);
     const charges = await stripeListAll('charges', {
       'created[gte]': String(inicio),
       'created[lte]': String(fim),
@@ -241,7 +248,7 @@ app.get('/api/stripe/pagamentos', async (req, res) => {
 
 app.get('/api/stripe/pagamentos/falhas', async (req, res) => {
   try {
-    const { inicio, fim } = getMesAtual();
+    const { inicio, fim } = getPeriodo(req);
     const charges = await stripeListAll('charges', {
       'created[gte]': String(inicio),
       'created[lte]': String(fim),
@@ -262,7 +269,7 @@ app.get('/api/stripe/pagamentos/falhas', async (req, res) => {
 
 app.get('/api/stripe/clientes/top', async (req, res) => {
   try {
-    const { inicio, fim } = getMesAtual();
+    const { inicio, fim } = getPeriodo(req);
     const charges = await stripeListAll('charges', {
       'created[gte]': String(inicio),
       'created[lte]': String(fim),
@@ -284,7 +291,7 @@ app.get('/api/stripe/clientes/top', async (req, res) => {
 
 app.get('/api/stripe/divisao-receita', async (req, res) => {
   try {
-    const { inicio, fim } = getMesAtual();
+    const { inicio, fim } = getPeriodo(req);
 
     // Buscar charges do mês
     const charges = await stripeListAll('charges', {
