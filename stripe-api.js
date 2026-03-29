@@ -113,13 +113,21 @@ app.get('/api/stripe/refunds', async (req, res) => {
 app.get('/api/stripe/churn', async (req, res) => {
   try {
     const { inicio, fim } = getMesAtual();
+
+    // Stripe não suporta filtro por canceled_at — busca tudo e filtra manualmente
     const canceled = await stripeListAll('subscriptions', {
       status: 'canceled',
-      'canceled_at[gte]': String(inicio),
-      'canceled_at[lte]': String(fim),
     });
-    res.json({ count: canceled.length });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+
+    const doMes = canceled.filter((sub) => {
+      const canceledAt = sub.canceled_at || sub.ended_at || 0;
+      return canceledAt >= inicio && canceledAt <= fim;
+    });
+
+    res.json({ count: doMes.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.get('/api/stripe/mrr-history', async (req, res) => {
