@@ -154,6 +154,122 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', keyConfigured: !!STRIPE_SECRET_KEY });
 });
 
+app.get('/api/stripe/volume-bruto', async (req, res) => {
+  try {
+    const { inicio, fim } = getMesAtual();
+    const charges = await stripeListAll('charges', {
+      'created[gte]': String(inicio),
+      'created[lte]': String(fim),
+    });
+    const bruto = charges
+      .filter(c => c.status === 'succeeded')
+      .reduce((sum, c) => sum + (c.amount || 0), 0) / 100;
+    const taxas = charges
+      .filter(c => c.status === 'succeeded')
+      .reduce((sum, c) => sum + (c.application_fee_amount || 0), 0) / 100;
+    const liquido = bruto - taxas;
+    const porStatus = {
+      succeeded: charges.filter(c => c.status === 'succeeded').length,
+      failed: charges.filter(c => c.status === 'failed').length,
+      pending: charges.filter(c => c.status === 'pending').length,
+    };
+    res.json({ bruto, liquido, taxas, porStatus, total: charges.length });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/stripe/pagamentos', async (req, res) => {
+  try {
+    const { inicio, fim } = getMesAtual();
+    const charges = await stripeListAll('charges', {
+      'created[gte]': String(inicio),
+      'created[lte]': String(fim),
+      expand: 'data.customer',
+    });
+    const pagamentos = charges.map(c => ({
+      id: c.id,
+      valor: (c.amount || 0) / 100,
+      status: c.status,
+      email: c.billing_details?.email || c.customer?.email || 'N/A',
+      descricao: c.description || '',
+      subconta: c.metadata?.subaccount || c.metadata?.location_name || c.metadata?.account_name || '',
+      tipo: c.invoice ? 'assinatura' : 'variavel',
+      data: new Date(c.created * 1000).toLocaleDateString('pt-BR'),
+      capturado: c.captured,
+    }));
+    res.json({ pagamentos, total: pagamentos.length });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/stripe/pagamentos/falhas', async (req, res) => {
+  try {
+    const { inicio, fim } = getMesAtual();
+    const charges = await stripeListAll('charges', {
+      'created[gte]': String(inicio),
+      'created[lte]': String(fim),
+    });
+    const falhas = charges
+      .filter(c => c.status === 'failed')
+      .map(c => ({
+        id: c.id,
+        valor: (c.amount || 0) / 100,
+        email: c.billing_details?.email || 'N/A',
+        motivo: c.failure_message || c.failure_code || 'Desconhecido',
+        data: new Date(c.created * 1000).toLocaleDateString('pt-BR'),
+        subconta: c.metadata?.subaccount || c.metadata?.location_name || '',
+      }));
+    res.json({ falhas, total: falhas.length });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/stripe/clientes/top', async (req, res) => {
+  try {
+    const { inicio, fim } = getMesAtual();
+    const charges = await stripeListAll('charges', {
+      'created[gte]': String(inicio),
+      'created[lte]': String(fim),
+    });
+    const porCliente = {};
+    for (const c of charges.filter(ch => ch.status === 'succeeded')) {
+      const email = c.billing_details?.email || c.customer || 'desconhecido';
+      const nome = c.billing_details?.name || email;
+      if (!porCliente[email]) porCliente[email] = { email, nome, total: 0, count: 0 };
+      porCliente[email].total += (c.amount || 0) / 100;
+      porCliente[email].count += 1;
+    }
+    const top = Object.values(porCliente)
+      .sort((a, b) => b.total - a.total)
+      .slice(0, 10);
+    res.json({ clientes: top });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/stripe/divisao-receita', async (req, res) => {
+  try {
+    const { inicio, fim } = getMesAtual();
+    const charges = await stripeListAll('charges', {
+      'created[gte]': String(inicio),
+      'created[lte]': String(fim),
+    });
+    const succeeded = charges.filter(c => c.status === 'succeeded');
+    const assinaturas = succeeded
+      .filter(c => c.invoice)
+      .reduce((sum, c) => sum + (c.amount || 0) / 100, 0);
+    const variaveis = succeeded
+      .filter(c => !c.invoice)
+      .reduce((sum, c) => sum + (c.amount || 0) / 100, 0);
+    const taxas = succeeded
+      .reduce((sum, c) => sum + (c.application_fee_amount || 0) / 100, 0);
+    const bruto = assinaturas + variaveis;
+    res.json({
+      bruto: parseFloat(bruto.toFixed(2)),
+      assinaturas: parseFloat(assinaturas.toFixed(2)),
+      variaveis: parseFloat(variaveis.toFixed(2)),
+      taxas: parseFloat(taxas.toFixed(2)),
+      liquido: parseFloat((bruto - taxas).toFixed(2)),
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.listen(PORT, () => {
   console.log(`Stripe API backend rodando na porta ${PORT}`);
 });
