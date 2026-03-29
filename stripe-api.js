@@ -183,13 +183,12 @@ app.get('/api/stripe/pagamentos', async (req, res) => {
     const charges = await stripeListAll('charges', {
       'created[gte]': String(inicio),
       'created[lte]': String(fim),
-      expand: 'data.customer',
     });
     const pagamentos = charges.map(c => ({
       id: c.id,
       valor: (c.amount || 0) / 100,
       status: c.status,
-      email: c.billing_details?.email || c.customer?.email || 'N/A',
+      email: c.billing_details?.email || 'N/A',
       descricao: c.description || '',
       subconta: c.metadata?.subaccount || c.metadata?.location_name || c.metadata?.account_name || '',
       tipo: c.invoice ? 'assinatura' : 'variavel',
