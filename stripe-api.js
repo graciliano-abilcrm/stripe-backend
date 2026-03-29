@@ -161,20 +161,56 @@ app.get('/api/stripe/volume-bruto', async (req, res) => {
       'created[gte]': String(inicio),
       'created[lte]': String(fim),
     });
-    const bruto = charges
+
+    // Calcular período anterior para comparação
+    const agora = new Date();
+    const inicioMesAnterior = new Date(agora.getFullYear(), agora.getMonth() - 1, 1);
+    const fimMesAnterior = new Date(agora.getFullYear(), agora.getMonth(), 0, 23, 59, 59);
+    const chargesAnterior = await stripeListAll('charges', {
+      'created[gte]': String(Math.floor(inicioMesAnterior.getTime() / 1000)),
+      'created[lte]': String(Math.floor(fimMesAnterior.getTime() / 1000)),
+    });
+
+    const periodoAnterior = chargesAnterior
       .filter(c => c.status === 'succeeded')
       .reduce((sum, c) => sum + (c.amount || 0), 0) / 100;
-    const taxas = charges
-      .filter(c => c.status === 'succeeded')
-      .reduce((sum, c) => sum + (c.application_fee_amount || 0), 0) / 100;
-    const liquido = bruto - taxas;
-    const porStatus = {
-      succeeded: charges.filter(c => c.status === 'succeeded').length,
-      failed: charges.filter(c => c.status === 'failed').length,
-      pending: charges.filter(c => c.status === 'pending').length,
-    };
-    res.json({ bruto, liquido, taxas, porStatus, total: charges.length });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+
+    const concluido = charges
+      .filter(c => c.status === 'succeeded' && !c.amount_refunded)
+      .reduce((sum, c) => sum + (c.amount || 0), 0) / 100;
+
+    const nao_capturado = charges
+      .filter(c => c.captured === false)
+      .reduce((sum, c) => sum + (c.amount || 0), 0) / 100;
+
+    const reembolsado = charges
+      .filter(c => c.amount_refunded > 0)
+      .reduce((sum, c) => sum + (c.amount_refunded || 0), 0) / 100;
+
+    const bloqueado = charges
+      .filter(c => c.status === 'succeeded' && c.outcome?.type === 'blocked')
+      .reduce((sum, c) => sum + (c.amount || 0), 0) / 100;
+
+    const malsucedido = charges
+      .filter(c => c.status === 'failed')
+      .reduce((sum, c) => sum + (c.amount || 0), 0) / 100;
+
+    const bruto = concluido + nao_capturado + bloqueado + malsucedido;
+
+    res.json({
+      bruto: parseFloat(bruto.toFixed(2)),
+      concluido: parseFloat(concluido.toFixed(2)),
+      nao_capturado: parseFloat(nao_capturado.toFixed(2)),
+      reembolsado: parseFloat(reembolsado.toFixed(2)),
+      bloqueado: parseFloat(bloqueado.toFixed(2)),
+      malsucedido: parseFloat(malsucedido.toFixed(2)),
+      periodo_anterior: parseFloat(periodoAnterior.toFixed(2)),
+      taxas: 0,
+      liquido: parseFloat(bruto.toFixed(2)),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.get('/api/stripe/pagamentos', async (req, res) => {
@@ -184,17 +220,21 @@ app.get('/api/stripe/pagamentos', async (req, res) => {
       'created[gte]': String(inicio),
       'created[lte]': String(fim),
     });
-    const pagamentos = charges.map(c => ({
-      id: c.id,
-      valor: (c.amount || 0) / 100,
-      status: c.status,
-      email: c.billing_details?.email || 'N/A',
-      descricao: c.description || '',
-      subconta: c.metadata?.subaccount || c.metadata?.location_name || c.metadata?.account_name || '',
-      tipo: c.invoice ? 'assinatura' : 'variavel',
-      data: new Date(c.created * 1000).toLocaleDateString('pt-BR'),
-      capturado: c.captured,
-    }));
+    const pagamentos = charges.map(c => {
+      const match = c.description?.match(/Auto-Recharge for Sub-Account - (.+?) (?:of BRL|\d)/);
+      const subconta = match ? match[1].trim() : '';
+      return {
+        id: c.id,
+        valor: (c.amount || 0) / 100,
+        status: c.status,
+        email: c.billing_details?.email || 'N/A',
+        descricao: c.description || '',
+        subconta,
+        tipo: c.invoice ? 'assinatura' : 'variavel',
+        data: new Date(c.created * 1000).toLocaleDateString('pt-BR'),
+        capturado: c.captured,
+      };
+    });
     res.json({ pagamentos, total: pagamentos.length });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
