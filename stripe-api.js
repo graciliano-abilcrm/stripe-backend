@@ -173,11 +173,13 @@ app.get('/api/stripe/volume-bruto', async (req, res) => {
       'created[lte]': String(fim),
     });
 
-    // Calcular período anterior com mesma duração, imediatamente antes
-    const duracaoDias = Math.floor((fim - inicio) / 86400);
-    const inicioAnterior = inicio - (duracaoDias * 86400);
-    const fimAnterior = inicio - 1;
-
+    // Calcular período anterior: exatamente 1 mês antes (não apenas subtrair dias)
+    const inicioAnteriorDate = new Date(inicio * 1000);
+    inicioAnteriorDate.setMonth(inicioAnteriorDate.getMonth() - 1);
+    const fimAnteriorDate = new Date(fim * 1000);
+    fimAnteriorDate.setMonth(fimAnteriorDate.getMonth() - 1);
+    const inicioAnterior = Math.floor(inicioAnteriorDate.getTime() / 1000);
+    const fimAnterior = Math.floor(fimAnteriorDate.getTime() / 1000);
     const chargesAnterior = await stripeListAll('charges', {
       'created[gte]': String(inicioAnterior),
       'created[lte]': String(fimAnterior),
@@ -385,6 +387,103 @@ app.get('/api/stripe/assinaturas/recentes', async (req, res) => {
 
     res.json({ assinaturas: recentes });
   } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+
+// GET /api/stripe/saldo
+app.get('/api/stripe/saldo', async (req, res) => {
+  try {
+    const balance = await stripeRequest('/v1/balance');
+    const disponivel = (balance.available || []).reduce((sum, b) => sum + b.amount, 0) / 100;
+    const pendente = (balance.pending || []).reduce((sum, b) => sum + b.amount, 0) / 100;
+    res.json({ disponivel: parseFloat(disponivel.toFixed(2)), pendente: parseFloat(pendente.toFixed(2)), total: parseFloat((disponivel + pendente).toFixed(2)) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/stripe/repasses
+app.get('/api/stripe/repasses', async (req, res) => {
+  try {
+    const payouts = await stripeListAll('payouts', {});
+    const realizados = payouts
+      .filter(p => p.status === 'paid')
+      .map(p => ({
+        id: p.id,
+        valor: p.amount / 100,
+        data_chegada: new Date(p.arrival_date * 1000).toLocaleDateString('pt-BR'),
+        status: p.status,
+        descricao: p.description || 'Repasse automático'
+      }));
+    const pendentes = payouts
+      .filter(p => ['pending', 'in_transit'].includes(p.status))
+      .map(p => ({
+        id: p.id,
+        valor: p.amount / 100,
+        data_chegada_prevista: new Date(p.arrival_date * 1000).toLocaleDateString('pt-BR'),
+        status: p.status
+      }));
+    const total_realizado = realizados.reduce((sum, p) => sum + p.valor, 0);
+    const total_pendente = pendentes.reduce((sum, p) => sum + p.valor, 0);
+    res.json({
+      realizados,
+      pendentes,
+      total_realizado: parseFloat(total_realizado.toFixed(2)),
+      total_pendente: parseFloat(total_pendente.toFixed(2))
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/stripe/repasses/projecao
+app.get('/api/stripe/repasses/projecao', async (req, res) => {
+  try {
+    const btxns = await stripeListAll('balance_transactions', { type: 'charge' });
+    const pending = btxns.filter(t => t.status === 'pending');
+    const a_receber_total = pending.reduce((sum, t) => sum + t.net, 0) / 100;
+
+    // Group by week of projected payout date (created + 15 days)
+    const weekMap = {};
+    pending.forEach(t => {
+      const payoutDate = new Date((t.created + 15 * 86400) * 1000);
+      // Get start of week (Monday)
+      const day = payoutDate.getDay();
+      const diff = (day === 0 ? -6 : 1 - day);
+      const weekStart = new Date(payoutDate);
+      weekStart.setDate(payoutDate.getDate() + diff);
+      weekStart.setHours(0, 0, 0, 0);
+      const weekEnd = new Date(weekStart);
+      weekEnd.setDate(weekStart.getDate() + 6);
+
+      const fmt = (d) => d.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' });
+      const key = 'Semana de ' + fmt(weekStart) + ' a ' + fmt(weekEnd);
+      if (!weekMap[key]) weekMap[key] = { semana: key, valor_previsto: 0, quantidade: 0, _sort: weekStart.getTime() };
+      weekMap[key].valor_previsto += t.net / 100;
+      weekMap[key].quantidade += 1;
+    });
+
+    const projecao = Object.values(weekMap)
+      .sort((a, b) => a._sort - b._sort)
+      .map(({ _sort, ...rest }) => ({ ...rest, valor_previsto: parseFloat(rest.valor_previsto.toFixed(2)) }));
+
+    // Next payout = earliest week
+    let proximo_repasse = { data_prevista: 'N/A', valor: 0 };
+    if (projecao.length > 0) {
+      proximo_repasse = {
+        data_prevista: projecao[0].semana,
+        valor: projecao[0].valor_previsto
+      };
+    }
+
+    res.json({
+      a_receber_total: parseFloat(a_receber_total.toFixed(2)),
+      projecao,
+      proximo_repasse
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.listen(PORT, () => {
