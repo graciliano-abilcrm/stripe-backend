@@ -527,6 +527,209 @@ app.get('/api/stripe/clientes/novos', async (req, res) => {
   }
 });
 
+// ============================================================
+// PAGBANK INTEGRATION
+// ============================================================
+
+const PAGBANK_TOKEN = process.env.PAGBANK_TOKEN || '';
+
+function pagbankRequest(path, queryParams = {}) {
+  return new Promise((resolve, reject) => {
+    const qs = new URLSearchParams(queryParams).toString();
+    const fullPath = qs ? `${path}?${qs}` : path;
+    const options = {
+      hostname: 'api.pagseguro.com',
+      path: fullPath,
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${PAGBANK_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+    };
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => (data += chunk));
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); }
+        catch (e) { reject(new Error('Erro ao parsear resposta do PagBank')); }
+      });
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+async function pagbankListAll(path, queryParams = {}) {
+  let all = [];
+  let currentParams = { ...queryParams, page_size: 100, page: 0 };
+  while (true) {
+    const result = await pagbankRequest(path, currentParams);
+    if (result.error_messages || result.error) {
+      throw new Error(JSON.stringify(result.error_messages || result.error));
+    }
+    const items = result.orders || result.items || [];
+    all = all.concat(items);
+    const hasNext = (result.links || []).some(l => l.rel === 'next');
+    if (!hasNext || items.length === 0) break;
+    currentParams.page = (currentParams.page || 0) + 1;
+  }
+  return all;
+}
+
+function getPeriodoPagbank(req) {
+  const agora = new Date();
+  let inicio, fim;
+  if (req.query.start && req.query.end) {
+    inicio = new Date(parseInt(req.query.start) * 1000);
+    fim = new Date(parseInt(req.query.end) * 1000);
+  } else {
+    inicio = new Date(agora.getFullYear(), agora.getMonth(), 1);
+    fim = new Date(agora.getFullYear(), agora.getMonth() + 1, 0, 23, 59, 59);
+  }
+  const toISO = (d) => {
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}-03:00`;
+  };
+  return { inicio: toISO(inicio), fim: toISO(fim) };
+}
+
+// GET /api/pagbank/saldo
+app.get('/api/pagbank/saldo', async (req, res) => {
+  try {
+    const data = await pagbankRequest('/accounts/balance');
+    const disponivel = (data.amount?.available?.value || 0) / 100;
+    const reservado = (data.amount?.reserved?.value || 0) / 100;
+    res.json({
+      disponivel: parseFloat(disponivel.toFixed(2)),
+      reservado: parseFloat(reservado.toFixed(2)),
+      total: parseFloat((disponivel + reservado).toFixed(2)),
+      moeda: 'BRL',
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/pagbank/volume
+app.get('/api/pagbank/volume', async (req, res) => {
+  try {
+    const { inicio, fim } = getPeriodoPagbank(req);
+    const orders = await pagbankListAll('/orders', {
+      'created_at.gte': inicio,
+      'created_at.lte': fim,
+    });
+
+    let pago = 0, pendente = 0, cancelado = 0, via_pix = 0, via_boleto = 0;
+    for (const order of orders) {
+      for (const charge of (order.charges || [])) {
+        const valor = (charge.amount?.value || 0) / 100;
+        const metodo = (charge.payment_method?.type || '').toUpperCase();
+        const status = (charge.status || '').toUpperCase();
+        if (status === 'PAID') {
+          pago += valor;
+          if (metodo === 'PIX') via_pix += valor;
+          if (metodo === 'BOLETO') via_boleto += valor;
+        } else if (['WAITING', 'PENDING', 'IN_ANALYSIS'].includes(status)) {
+          pendente += valor;
+        } else if (['CANCELED', 'DECLINED', 'UNAUTHORIZED', 'CHARGEBACK'].includes(status)) {
+          cancelado += valor;
+        }
+      }
+    }
+
+    const toISO = (d) => {
+      const pad = (n) => String(n).padStart(2, '0');
+      return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}-03:00`;
+    };
+    const inicioDate = new Date(inicio);
+    inicioDate.setMonth(inicioDate.getMonth() - 1);
+    const fimDate = new Date(fim);
+    fimDate.setMonth(fimDate.getMonth() - 1);
+    const ordersAnterior = await pagbankListAll('/orders', {
+      'created_at.gte': toISO(inicioDate),
+      'created_at.lte': toISO(fimDate),
+    });
+    let periodo_anterior = 0;
+    for (const order of ordersAnterior) {
+      for (const charge of (order.charges || [])) {
+        if ((charge.status || '').toUpperCase() === 'PAID') {
+          periodo_anterior += (charge.amount?.value || 0) / 100;
+        }
+      }
+    }
+
+    res.json({
+      pago: parseFloat(pago.toFixed(2)),
+      pendente: parseFloat(pendente.toFixed(2)),
+      cancelado: parseFloat(cancelado.toFixed(2)),
+      via_pix: parseFloat(via_pix.toFixed(2)),
+      via_boleto: parseFloat(via_boleto.toFixed(2)),
+      periodo_anterior: parseFloat(periodo_anterior.toFixed(2)),
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/pagbank/transacoes
+app.get('/api/pagbank/transacoes', async (req, res) => {
+  try {
+    const { inicio, fim } = getPeriodoPagbank(req);
+    const orders = await pagbankListAll('/orders', {
+      'created_at.gte': inicio,
+      'created_at.lte': fim,
+    });
+    const transacoes = [];
+    for (const order of orders) {
+      for (const charge of (order.charges || [])) {
+        transacoes.push({
+          id: charge.id,
+          order_id: order.id,
+          reference: order.reference_id || '',
+          valor: (charge.amount?.value || 0) / 100,
+          status: charge.status || 'N/A',
+          metodo: charge.payment_method?.type || 'N/A',
+          nome: order.customer?.name || 'N/A',
+          email: order.customer?.email || 'N/A',
+          data_criacao: new Date(order.created_at).toLocaleDateString('pt-BR'),
+          data_pagamento: charge.paid_at
+            ? new Date(charge.paid_at).toLocaleDateString('pt-BR')
+            : null,
+        });
+      }
+    }
+    transacoes.sort((a, b) => new Date(b.data_criacao) - new Date(a.data_criacao));
+    res.json({ transacoes, total: transacoes.length });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/pagbank/repasses
+app.get('/api/pagbank/repasses', async (req, res) => {
+  try {
+    const { inicio, fim } = getPeriodoPagbank(req);
+    const result = await pagbankRequest('/transfers', {
+      'created_at.gte': inicio,
+      'created_at.lte': fim,
+    });
+    const transferencias = (result.items || []).map(t => ({
+      id: t.id,
+      valor: (t.amount?.value || 0) / 100,
+      status: t.status || 'N/A',
+      banco: t.account_bank?.bank_code || 'N/A',
+      data_criacao: t.created_at
+        ? new Date(t.created_at).toLocaleDateString('pt-BR')
+        : 'N/A',
+    }));
+    const total_realizado = transferencias
+      .filter(t => t.status === 'SUCCEEDED')
+      .reduce((sum, t) => sum + t.valor, 0);
+    const total_pendente = transferencias
+      .filter(t => ['WAITING', 'IN_ANALYSIS'].includes(t.status))
+      .reduce((sum, t) => sum + t.valor, 0);
+    res.json({
+      transferencias,
+      total_realizado: parseFloat(total_realizado.toFixed(2)),
+      total_pendente: parseFloat(total_pendente.toFixed(2)),
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.listen(PORT, () => {
   console.log(`Stripe API backend rodando na porta ${PORT}`);
 });
