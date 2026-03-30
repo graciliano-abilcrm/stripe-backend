@@ -219,9 +219,14 @@ app.get('/api/stripe/volume-bruto', async (req, res) => {
       .filter(c => c.status === 'failed')
       .reduce((sum, c) => sum + (c.amount || 0), 0) / 100;
 
-    const taxas = 0;
-    const liquido = parseFloat((bruto - taxas).toFixed(2));
-
+    // Buscar taxas reais via balance_transactions do período
+    const balanceTxns = await stripeListAll('balance_transactions', {
+      type: 'charge',
+      'created[gte]': String(inicio),
+      'created[lte]': String(fim),
+    });
+    const taxasReais = balanceTxns.reduce((sum, bt) => sum + (bt.fee || 0), 0) / 100;
+    const liquido = parseFloat((bruto - taxasReais).toFixed(2));
     res.json({
       bruto: parseFloat(bruto.toFixed(2)),
       concluido: parseFloat(concluido.toFixed(2)),
@@ -230,7 +235,7 @@ app.get('/api/stripe/volume-bruto', async (req, res) => {
       bloqueado: parseFloat(bloqueado.toFixed(2)),
       malsucedido: parseFloat(malsucedido.toFixed(2)),
       periodo_anterior: parseFloat(periodoAnterior.toFixed(2)),
-      taxas,
+      taxas: parseFloat(taxasReais.toFixed(2)),
       liquido,
     });
   } catch (err) {
@@ -403,9 +408,18 @@ app.get('/api/stripe/saldo', async (req, res) => {
 });
 
 // GET /api/stripe/repasses
+// GET /api/stripe/repasses
 app.get('/api/stripe/repasses', async (req, res) => {
   try {
-    const payouts = await stripeListAll('payouts', {});
+    let params = {};
+    if (req.query.start && req.query.end) {
+      params['created[gte]'] = req.query.start;
+      params['created[lte]'] = req.query.end;
+    } else {
+      const noventa = Math.floor(Date.now() / 1000) - (90 * 86400);
+      params['created[gte]'] = String(noventa);
+    }
+    const payouts = await stripeListAll('payouts', params);
     const realizados = payouts
       .filter(p => p.status === 'paid')
       .map(p => ({
