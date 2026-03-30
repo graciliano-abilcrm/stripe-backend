@@ -563,17 +563,18 @@ function pagbankRequest(path, queryParams = {}) {
 
 async function pagbankListAll(path, queryParams = {}) {
   let all = [];
-  let currentParams = { ...queryParams, page_size: 100, page: 0 };
+  let offset = 0;
+  const limit = 100;
   while (true) {
+    const currentParams = { ...queryParams, limit, offset };
     const result = await pagbankRequest(path, currentParams);
     if (result.error_messages || result.error) {
       throw new Error(JSON.stringify(result.error_messages || result.error));
     }
     const items = result.orders || result.items || [];
     all = all.concat(items);
-    const hasNext = (result.links || []).some(l => l.rel === 'next');
-    if (!hasNext || items.length === 0) break;
-    currentParams.page = (currentParams.page || 0) + 1;
+    if (items.length < limit) break;
+    offset += limit;
   }
   return all;
 }
@@ -615,8 +616,8 @@ app.get('/api/pagbank/volume', async (req, res) => {
   try {
     const { inicio, fim } = getPeriodoPagbank(req);
     const orders = await pagbankListAll('/orders', {
-      'created_at.gte': inicio,
-      'created_at.lte': fim,
+      'created_at[gte]': inicio,
+      'created_at[lte]': fim,
     });
 
     let pago = 0, pendente = 0, cancelado = 0, via_pix = 0, via_boleto = 0;
@@ -646,8 +647,8 @@ app.get('/api/pagbank/volume', async (req, res) => {
     const fimDate = new Date(fim);
     fimDate.setMonth(fimDate.getMonth() - 1);
     const ordersAnterior = await pagbankListAll('/orders', {
-      'created_at.gte': toISO(inicioDate),
-      'created_at.lte': toISO(fimDate),
+      'created_at[gte]': toISO(inicioDate),
+      'created_at[lte]': toISO(fimDate),
     });
     let periodo_anterior = 0;
     for (const order of ordersAnterior) {
@@ -674,8 +675,8 @@ app.get('/api/pagbank/transacoes', async (req, res) => {
   try {
     const { inicio, fim } = getPeriodoPagbank(req);
     const orders = await pagbankListAll('/orders', {
-      'created_at.gte': inicio,
-      'created_at.lte': fim,
+      'created_at[gte]': inicio,
+      'created_at[lte]': fim,
     });
     const transacoes = [];
     for (const order of orders) {
@@ -706,8 +707,8 @@ app.get('/api/pagbank/repasses', async (req, res) => {
   try {
     const { inicio, fim } = getPeriodoPagbank(req);
     const result = await pagbankRequest('/transfers', {
-      'created_at.gte': inicio,
-      'created_at.lte': fim,
+      'created_at[gte]': inicio,
+      'created_at[lte]': fim,
     });
     const transferencias = (result.items || []).map(t => ({
       id: t.id,
