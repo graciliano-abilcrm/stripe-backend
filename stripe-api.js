@@ -733,12 +733,15 @@ app.get('/api/pagbank/repasses', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// GET /api/pagbank/debug — testa chamada raw sem parâmetros
+// GET /api/pagbank/debug — testa múltiplos endpoints PagBank
 app.get('/api/pagbank/debug', async (req, res) => {
-  try {
-    const raw = await pagbankRequest('/orders');
-    res.json({ raw, host: PAGBANK_HOST, env: PAGBANK_ENV });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  const results = {};
+  const endpoints = ['/charges', '/statements', '/account/statements', '/transfers', '/pix/payment'];
+  for (const ep of endpoints) {
+    try { results[ep] = await pagbankRequest(ep); }
+    catch (e) { results[ep] = { error: e.message }; }
+  }
+  res.json({ host: PAGBANK_HOST, env: PAGBANK_ENV, results });
 });
 
 app.listen(PORT, () => {
