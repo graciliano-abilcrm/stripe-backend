@@ -219,14 +219,19 @@ app.get('/api/stripe/volume-bruto', async (req, res) => {
       .filter(c => c.status === 'failed')
       .reduce((sum, c) => sum + (c.amount || 0), 0) / 100;
 
-    // Buscar taxas reais via balance_transactions do período
-    const balanceTxns = await stripeListAll('balance_transactions', {
-      type: 'charge',
+    // Buscar TODOS os balance_transactions do período (todos os tipos)
+    const allBalanceTxns = await stripeListAll('balance_transactions', {
       'created[gte]': String(inicio),
       'created[lte]': String(fim),
     });
-    const taxasReais = balanceTxns.reduce((sum, bt) => sum + (bt.fee || 0), 0) / 100;
-    const liquido = parseFloat((bruto - taxasReais).toFixed(2));
+    // liquido = soma do campo net (já desconta taxas, reembolsos, disputas, Connect)
+    const liquido = allBalanceTxns
+      .filter(bt => ['charge','refund','adjustment','dispute'].includes(bt.type))
+      .reduce((sum, bt) => sum + (bt.net || 0), 0) / 100;
+    // taxas reais = soma do campo fee das transações de charge
+    const taxasReais = allBalanceTxns
+      .filter(bt => bt.type === 'charge')
+      .reduce((sum, bt) => sum + (bt.fee || 0), 0) / 100;
     res.json({
       bruto: parseFloat(bruto.toFixed(2)),
       concluido: parseFloat(concluido.toFixed(2)),
@@ -236,7 +241,7 @@ app.get('/api/stripe/volume-bruto', async (req, res) => {
       malsucedido: parseFloat(malsucedido.toFixed(2)),
       periodo_anterior: parseFloat(periodoAnterior.toFixed(2)),
       taxas: parseFloat(taxasReais.toFixed(2)),
-      liquido,
+      liquido: parseFloat(liquido.toFixed(2)),
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -494,6 +499,28 @@ app.get('/api/stripe/repasses/projecao', async (req, res) => {
       a_receber_total: parseFloat(a_receber_total.toFixed(2)),
       projecao,
       proximo_repasse
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/stripe/clientes/novos
+app.get('/api/stripe/clientes/novos', async (req, res) => {
+  try {
+    const { inicio, fim } = getPeriodo(req);
+    const clientes = await stripeListAll('customers', {
+      'created[gte]': String(inicio),
+      'created[lte]': String(fim),
+    });
+    res.json({
+      total: clientes.length,
+      clientes: clientes.map(c => ({
+        id: c.id,
+        email: c.email || 'N/A',
+        nome: c.name || c.email || 'N/A',
+        data_criacao: new Date(c.created * 1000).toLocaleDateString('pt-BR')
+      }))
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
