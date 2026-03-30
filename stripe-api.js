@@ -733,6 +733,14 @@ app.get('/api/pagbank/repasses', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// GET /api/pagbank/debug — testa chamada raw sem parâmetros
+app.get('/api/pagbank/debug', async (req, res) => {
+  try {
+    const raw = await pagbankRequest('/orders');
+    res.json({ raw, host: PAGBANK_HOST, env: PAGBANK_ENV });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.listen(PORT, () => {
   console.log(`Stripe API backend rodando na porta ${PORT}`);
 });
