@@ -542,7 +542,7 @@ function pagbankRequest(path, queryParams = {}) {
       path: fullPath,
       method: 'GET',
       headers: {
-        Authorization: `Bearer ${PAGBANK_TOKEN}`,
+        Authorization: `${PAGBANK_TOKEN}`,
         'Content-Type': 'application/json',
       },
     };
