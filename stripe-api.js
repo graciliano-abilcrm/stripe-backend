@@ -532,17 +532,19 @@ app.get('/api/stripe/clientes/novos', async (req, res) => {
 // ============================================================
 
 const PAGBANK_TOKEN = process.env.PAGBANK_TOKEN || '';
+const PAGBANK_ENV = process.env.PAGBANK_ENV || 'production';
+const PAGBANK_HOST = PAGBANK_ENV === 'sandbox' ? 'sandbox.api.pagseguro.com' : 'api.pagseguro.com';
 
 function pagbankRequest(path, queryParams = {}) {
   return new Promise((resolve, reject) => {
     const qs = new URLSearchParams(queryParams).toString();
     const fullPath = qs ? `${path}?${qs}` : path;
     const options = {
-      hostname: 'api.pagseguro.com',
+      hostname: PAGBANK_HOST,
       path: fullPath,
       method: 'GET',
       headers: {
-        Authorization: `${PAGBANK_TOKEN}`,
+        Authorization: `Bearer ${PAGBANK_TOKEN}`,
         'Content-Type': 'application/json',
       },
     };
