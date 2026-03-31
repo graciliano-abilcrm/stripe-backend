@@ -858,20 +858,27 @@ app.get('/api/ghl/custo-subcontas', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// GET /api/ghl/debug — testa conectividade e descobre endpoints disponiveis
+// GET /api/ghl/debug — testa multiplos endpoints para descobrir paths corretos
 app.get('/api/ghl/debug', async (req, res) => {
   try {
-    const [r1, r2, r3] = await Promise.all([
-      ghlRequest('/v1/agency/companies?limit=5'),
-      ghlRequest('/v1/agency/billing/wallet'),
-      ghlRequest('/v1/agency/reseller/revenue?startDate=2026-03-01&endDate=2026-03-31'),
-    ]);
+    const paths = [
+      '/locations/search?limit=5',
+      '/locations/?limit=5',
+      '/saas/revenue',
+      '/saas/agency-billing',
+      '/v1/agency/billing',
+      '/v1/locations/?limit=5',
+      '/v2/locations/search?limit=5',
+      '/payments/subscriptions?limit=5',
+    ];
+    const results = await Promise.all(paths.map(async (p) => {
+      const r = await ghlRequest(p);
+      return { path: p, status: r.status, sample: JSON.stringify(r.body).substring(0, 150) };
+    }));
     res.json({
       key_configured: !!GHL_AGENCY_KEY,
       key_prefix: GHL_AGENCY_KEY.substring(0, 12),
-      companies: { status: r1.status, sample: JSON.stringify(r1.body).substring(0, 300) },
-      wallet: { status: r2.status, data: JSON.stringify(r2.body).substring(0, 300) },
-      revenue: { status: r3.status, data: JSON.stringify(r3.body).substring(0, 300) },
+      results,
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
