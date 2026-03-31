@@ -974,9 +974,24 @@ app.get('/api/ghl/cruzamento', async (req, res) => {
 
     const resultado = locations.map(loc => {
       const nomeGHL = loc.name || '';
+      const locId = loc.id;
 
-      // Match exato por nome normalizado
-      let match = stripeClientes.find(c =>
+      // PRIORIDADE 1: Mapeamento manual salvo pelo usuario
+      let match = null;
+      let mapeamentoManual = false;
+      for (const [stripeId, map] of Object.entries(manualMappings)) {
+        if (map.ghl_location_id === locId) {
+          const cliente = stripeClientes.find(c => c.id === stripeId);
+          if (cliente && !matchedStripeIds.has(cliente.id)) {
+            match = cliente;
+            mapeamentoManual = true;
+            break;
+          }
+        }
+      }
+
+      // PRIORIDADE 2: Match exato por nome normalizado
+      if (!match) match = stripeClientes.find(c =>
         !matchedStripeIds.has(c.id) &&
         normalizeName(c.nome) === normalizeName(nomeGHL) &&
         normalizeName(nomeGHL).length >= 3
@@ -1009,6 +1024,7 @@ app.get('/api/ghl/cruzamento', async (req, res) => {
         stripe_nome_match: match ? match.nome : null,
         assinatura: match ? match.sub : null,
         receita_mensal: match && match.sub ? match.sub.valor : 0,
+        mapeamento_manual: mapeamentoManual,
         alerta: !match ? 'SEM_COBRANCA' : null,
       };
     });
@@ -1039,10 +1055,91 @@ app.get('/api/ghl/cruzamento', async (req, res) => {
         email: c.email,
         receita_mensal: c.sub ? c.sub.valor : 0,
         plano: c.sub ? c.sub.plano : null,
+        ja_mapeado: !!manualMappings[c.id],
       })),
       gerado_em: new Date().toISOString(),
     });
   } catch (err) { res.status(500).json({ error: err.message, stack: err.stack }); }
+});
+
+// ============================================================
+// MAPEAMENTOS MANUAIS GHL <-> STRIPE (persistencia em arquivo)
+// Permite vincular manualmente clientes Stripe a subcontas GHL
+// quando o match automatico por nome nao funciona
+// ============================================================
+
+const fs = require('fs');
+const MAPPINGS_FILE = '/tmp/ghl_stripe_mappings.json';
+
+// Carrega mapeamentos do arquivo (persiste entre restarts)
+function loadMappings() {
+  try {
+    if (fs.existsSync(MAPPINGS_FILE)) {
+      return JSON.parse(fs.readFileSync(MAPPINGS_FILE, 'utf8'));
+    }
+  } catch (e) { console.error('Erro ao carregar mappings:', e.message); }
+  return {};
+}
+
+// Salva mapeamentos no arquivo
+function saveMappings(mappings) {
+  try { fs.writeFileSync(MAPPINGS_FILE, JSON.stringify(mappings, null, 2)); }
+  catch (e) { console.error('Erro ao salvar mappings:', e.message); }
+}
+
+// Objeto em memoria (chave: stripe_customer_id, valor: { ghl_location_id, ghl_nome, stripe_nome, criado_em })
+let manualMappings = loadMappings();
+
+// GET /api/ghl/locations — lista todas as subcontas GHL em tempo real (para dropdown de vinculação)
+app.get('/api/ghl/locations', async (req, res) => {
+  try {
+    const locations = await ghlGetAllLocations();
+    const search = (req.query.search || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+    const result = locations
+      .map(l => ({ id: l.id, nome: l.name || '', email: l.email || '' }))
+      .filter(l => {
+        if (!search) return true;
+        const nome = l.nome.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+        const email = l.email.toLowerCase();
+        return nome.includes(search) || email.includes(search);
+      })
+      .sort((a, b) => a.nome.localeCompare(b.nome));
+    res.json({ total: result.length, locations: result });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/ghl/mapeamentos — lista todos os mapeamentos manuais salvos
+app.get('/api/ghl/mapeamentos', (req, res) => {
+  res.json({
+    total: Object.keys(manualMappings).length,
+    mapeamentos: manualMappings,
+  });
+});
+
+// POST /api/ghl/mapeamentos — salva um novo mapeamento manual
+// Body: { stripe_customer_id, stripe_nome, ghl_location_id, ghl_nome }
+app.post('/api/ghl/mapeamentos', express.json(), (req, res) => {
+  const { stripe_customer_id, stripe_nome, ghl_location_id, ghl_nome } = req.body || {};
+  if (!stripe_customer_id || !ghl_location_id) {
+    return res.status(400).json({ error: 'stripe_customer_id e ghl_location_id sao obrigatorios' });
+  }
+  manualMappings[stripe_customer_id] = {
+    ghl_location_id,
+    ghl_nome: ghl_nome || '',
+    stripe_nome: stripe_nome || '',
+    criado_em: new Date().toISOString(),
+  };
+  saveMappings(manualMappings);
+  res.json({ ok: true, mapeamento: manualMappings[stripe_customer_id] });
+});
+
+// DELETE /api/ghl/mapeamentos/:stripe_customer_id — remove um mapeamento
+app.delete('/api/ghl/mapeamentos/:stripe_customer_id', (req, res) => {
+  const id = req.params.stripe_customer_id;
+  if (!manualMappings[id]) return res.status(404).json({ error: 'Mapeamento nao encontrado' });
+  delete manualMappings[id];
+  saveMappings(manualMappings);
+  res.json({ ok: true, removido: id });
 });
 
 app.listen(PORT, () => {
