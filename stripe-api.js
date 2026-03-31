@@ -541,7 +541,7 @@ function xmlVal(xml, tag) {
 
 function xmlAll(xml, tag) {
   const results = [];
-  const re = new RegExp('<' + tag + '[^>]*>([\s\S]*?)<\/' + tag + '>', 'g');
+  const re = new RegExp('<' + tag + '(?![a-zA-Z])[^>]*>([\s\S]*?)<\/' + tag + '>', 'g');
   let m;
   while ((m = re.exec(xml)) !== null) results.push(m[1]);
   return results;
@@ -636,7 +636,7 @@ async function pagbankListAllTx(initialDate, finalDate) {
 // GET /api/pagbank/saldo
 app.get('/api/pagbank/saldo', async (req, res) => {
   try {
-    const result = await pagbankLegacyRequest('/v2/balance');
+    const result = await pagbankLegacyRequest('/pagseguro-api/v2/balance');
     const xml = result._body;
     const quantities = xmlAll(xml, 'quantity');
     const disponivel = parseFloat(quantities[0] || '0');
