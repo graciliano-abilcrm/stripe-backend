@@ -633,7 +633,7 @@ async function pagbankListAllTx(initialDate, finalDate) {
   return all;
 }
 
-// GET /api/pagbank/saldo — usa PagBank Connect API (legacy nao tem balance)
+// GET /api/pagbank/saldo
 app.get('/api/pagbank/saldo', async (req, res) => {
   try {
     const result = await new Promise((resolve, reject) => {
@@ -651,11 +651,14 @@ app.get('/api/pagbank/saldo', async (req, res) => {
       req.on('error', reject);
       req.end();
     });
-    if (result._status !== 200) throw new Error('PagBank saldo error (' + result._status + '): ' + result._body.substring(0, 300));
-    const data = JSON.parse(result._body);
-    // Response: { type, amount: { value } } — value in centavos
-    const disponivel = (data.amount && data.amount.value !== undefined) ? data.amount.value / 100 : 0;
-    res.json({ disponivel: parseFloat(disponivel.toFixed(2)), a_liberar: 0, total: parseFloat(disponivel.toFixed(2)), moeda: 'BRL', raw: data });
+    if (result._status === 200) {
+      const data = JSON.parse(result._body);
+      const disponivel = (data.amount && data.amount.value !== undefined) ? data.amount.value / 100 : 0;
+      res.json({ disponivel: parseFloat(disponivel.toFixed(2)), a_liberar: 0, total: parseFloat(disponivel.toFixed(2)), moeda: 'BRL' });
+    } else {
+      // Balance API not available with this token (requires Connect OAuth scope)
+      res.json({ disponivel: null, a_liberar: null, total: null, moeda: 'BRL', nota: 'Saldo indisponivel - token sem permissao accounts.read' });
+    }
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
