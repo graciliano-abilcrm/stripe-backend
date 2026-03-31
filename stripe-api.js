@@ -763,6 +763,119 @@ app.get('/api/pagbank/debug', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+
+// ============================================================
+// GHL AGENCY INTEGRATION
+// ============================================================
+
+const GHL_AGENCY_KEY = process.env.GHL_AGENCY_KEY || '';
+const GHL_BASE = 'services.leadconnectorhq.com';
+
+function ghlRequest(path, method = 'GET', body = null) {
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: GHL_BASE,
+      path,
+      method,
+      headers: {
+        'Authorization': 'Bearer ' + GHL_AGENCY_KEY,
+        'Content-Type': 'application/json',
+        'Version': '2021-07-28',
+      },
+    };
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => (data += chunk));
+      res.on('end', () => {
+        try { resolve({ body: JSON.parse(data), status: res.statusCode }); }
+        catch(e) { resolve({ body: data, status: res.statusCode }); }
+      });
+    });
+    req.on('error', reject);
+    if (body) req.write(JSON.stringify(body));
+    req.end();
+  });
+}
+
+// GET /api/ghl/subcontas — lista todas as subcontas
+app.get('/api/ghl/subcontas', async (req, res) => {
+  try {
+    const result = await ghlRequest('/v1/agency/companies?limit=100&skip=0');
+    if (result.status !== 200) return res.status(result.status).json({ error: result.body });
+    const locations = (result.body.companies || result.body.locations || []).map(l => ({
+      id: l.id || l._id,
+      nome: l.name,
+      email: l.email,
+      plano: l.plan,
+      ativo: l.isActive,
+    }));
+    res.json({ total: locations.length, subcontas: locations });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/ghl/revenda — receita de refaturamento por subconta
+app.get('/api/ghl/revenda', async (req, res) => {
+  try {
+    const now = new Date();
+    const mes = req.query.mes || (now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0'));
+    const [ano, m] = mes.split('-');
+    const startDate = ano + '-' + m + '-01';
+    const endDate = new Date(parseInt(ano), parseInt(m), 0);
+    const endStr = ano + '-' + m + '-' + String(endDate.getDate()).padStart(2, '0');
+
+    // Reseller revenue por produto
+    const revenueResult = await ghlRequest('/v1/agency/reseller/revenue?startDate=' + startDate + '&endDate=' + endStr);
+    // Wallet/carteira info
+    const walletResult = await ghlRequest('/v1/agency/billing/wallet');
+
+    res.json({
+      mes,
+      receita: revenueResult.body,
+      carteira: walletResult.body,
+      debug_revenue_status: revenueResult.status,
+      debug_wallet_status: walletResult.status,
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/ghl/custo-subcontas — custo variavel por subconta (para cruzamento com Stripe)
+app.get('/api/ghl/custo-subcontas', async (req, res) => {
+  try {
+    const now = new Date();
+    const mes = req.query.mes || (now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0'));
+    const [ano, m] = mes.split('-');
+    const startDate = ano + '-' + m + '-01';
+    const endDate = new Date(parseInt(ano), parseInt(m), 0);
+    const endStr = ano + '-' + m + '-' + String(endDate.getDate()).padStart(2, '0');
+
+    // Custo por subconta
+    const result = await ghlRequest('/v1/agency/billing/usage?startDate=' + startDate + '&endDate=' + endStr);
+    res.json({
+      mes,
+      status: result.status,
+      data: result.body,
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/ghl/debug — testa conectividade e descobre endpoints disponiveis
+app.get('/api/ghl/debug', async (req, res) => {
+  try {
+    const [r1, r2, r3] = await Promise.all([
+      ghlRequest('/v1/agency/companies?limit=5'),
+      ghlRequest('/v1/agency/billing/wallet'),
+      ghlRequest('/v1/agency/reseller/revenue?startDate=2026-03-01&endDate=2026-03-31'),
+    ]);
+    res.json({
+      key_configured: !!GHL_AGENCY_KEY,
+      key_prefix: GHL_AGENCY_KEY.substring(0, 12),
+      companies: { status: r1.status, sample: JSON.stringify(r1.body).substring(0, 300) },
+      wallet: { status: r2.status, data: JSON.stringify(r2.body).substring(0, 300) },
+      revenue: { status: r3.status, data: JSON.stringify(r3.body).substring(0, 300) },
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.listen(PORT, () => {
   console.log(`Stripe API backend rodando na porta ${PORT}`);
 });
