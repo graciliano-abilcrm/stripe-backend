@@ -593,6 +593,27 @@ function getPeriodoPagbank(req) {
   return { inicio: toPS(inicio), fim: toPS(fim), inicioDate: inicio, fimDate: fim };
 }
 
+// Cache em memória: referencia -> nome do link (evita chamadas repetidas)
+const linkNomeCache = {};
+
+// Busca o nome real do link de pagamento PagSeguro pelo código de referência
+// Endpoint: GET /v2/payment-requests/{code}
+async function fetchLinkNome(referencia) {
+  if (!referencia || linkNomeCache[referencia] !== undefined) {
+    return linkNomeCache[referencia] || null;
+  }
+  try {
+    const result = await pagbankLegacyRequest('/v2/payment-requests/' + referencia);
+    if (result._status === 200 && result._body.includes('<paymentRequest>')) {
+      const nome = xmlVal(result._body, 'name') || xmlVal(result._body, 'shortName') || null;
+      linkNomeCache[referencia] = nome;
+      return nome;
+    }
+  } catch (e) { /* silencioso */ }
+  linkNomeCache[referencia] = null;
+  return null;
+}
+
 function parseTx(txXml) {
   const pmMatch = txXml.match(/<paymentMethod[^>]*>([\s\S]*?)<\/paymentMethod>/);
   const pmType = pmMatch ? xmlVal(pmMatch[1], 'type') : '';
@@ -725,7 +746,17 @@ app.get('/api/pagbank/transacoes', async (req, res) => {
     const { inicio, fim } = getPeriodoPagbank(req);
     const txs = await pagbankListAllTx(inicio, fim);
     txs.sort((a, b) => new Date(b.data) - new Date(a.data));
-    res.json({ transacoes: txs, total: txs.length });
+
+    // Enriquecer com nome real do link (busca em paralelo, com cache)
+    const refs = [...new Set(txs.map(t => t.referencia).filter(Boolean))];
+    await Promise.all(refs.map(r => fetchLinkNome(r)));
+
+    const enriquecidas = txs.map(tx => ({
+      ...tx,
+      link_pagamento: linkNomeCache[tx.referencia] || tx.link_pagamento,
+    }));
+
+    res.json({ transacoes: enriquecidas, total: enriquecidas.length });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -821,21 +852,28 @@ app.get('/api/pagamentos', async (req, res) => {
       };
     });
 
-    const pagbank = txsPagbank.map(tx => ({
-      id: tx.id,
-      plataforma: 'pagbank',
-      valor: tx.bruto,
-      status: tx.status === 'disponivel' || tx.status === 'pago' ? 'aprovado' : tx.status === 'cancelado' || tx.status === 'devolvido' ? 'falhou' : tx.status,
-      email: tx.email || 'N/A',
-      descricao: tx.link_pagamento || tx.referencia || '',
-      subconta: '',
-      tipo: tx.metodo === 'recorrente' ? 'assinatura' : 'variavel',
-      metodo: tx.metodo,
-      link_pagamento: tx.link_pagamento,
-      referencia: tx.referencia,
-      data: tx.data,
-      data_sort: new Date(tx.data).getTime() / 1000,
-    }));
+    // Enriquecer PagBank com nome real do link (cache compartilhado)
+    const refs = [...new Set(txsPagbank.map(t => t.referencia).filter(Boolean))];
+    await Promise.all(refs.map(r => fetchLinkNome(r)));
+
+    const pagbank = txsPagbank.map(tx => {
+      const nomeLink = linkNomeCache[tx.referencia] || tx.link_pagamento;
+      return {
+        id: tx.id,
+        plataforma: 'pagbank',
+        valor: tx.bruto,
+        status: tx.status === 'disponivel' || tx.status === 'pago' ? 'aprovado' : tx.status === 'cancelado' || tx.status === 'devolvido' ? 'falhou' : tx.status,
+        email: tx.email || 'N/A',
+        descricao: nomeLink || tx.referencia || '',
+        subconta: nomeLink || '',
+        tipo: tx.metodo === 'recorrente' ? 'assinatura' : 'variavel',
+        metodo: tx.metodo,
+        link_pagamento: nomeLink,
+        referencia: tx.referencia,
+        data: tx.data,
+        data_sort: new Date(tx.data).getTime() / 1000,
+      };
+    });
 
     const todos = [...stripe, ...pagbank].sort((a, b) => b.data_sort - a.data_sort);
     res.json({ pagamentos: todos, total: todos.length, stripe: stripe.length, pagbank: pagbank.length });
