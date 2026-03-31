@@ -633,38 +633,29 @@ async function pagbankListAllTx(initialDate, finalDate) {
   return all;
 }
 
-// GET /api/pagbank/saldo
+// GET /api/pagbank/saldo — Legacy API (ws.pagseguro.uol.com.br)
 app.get('/api/pagbank/saldo', async (req, res) => {
   try {
-    const result = await new Promise((resolve, reject) => {
-      const options = {
-        hostname: 'api.pagseguro.com',
-        path: '/accounts/balance',
-        method: 'GET',
-        headers: { 'Authorization': 'Bearer ' + PAGBANK_TOKEN, 'Accept': 'application/json' },
-      };
-      const req = https.request(options, (r) => {
-        let data = '';
-        r.on('data', (chunk) => (data += chunk));
-        r.on('end', () => resolve({ _body: data, _status: r.statusCode }));
+    const result = await pagbankLegacyRequest('/v2/balance');
+    const xml = result._body;
+    if (result._status === 200 && xml.includes('<balance>')) {
+      const availableMatch = xml.match(/<available[^>]*>([\s\S]*?)<\/available>/);
+      const releasingMatch = xml.match(/<releasing[^>]*>([\s\S]*?)<\/releasing>/);
+      const disponivel = availableMatch ? parseFloat(xmlVal(availableMatch[1], 'value') || '0') : 0;
+      const a_liberar = releasingMatch ? parseFloat(xmlVal(releasingMatch[1], 'value') || '0') : 0;
+      res.json({
+        disponivel: parseFloat(disponivel.toFixed(2)),
+        a_liberar: parseFloat(a_liberar.toFixed(2)),
+        total: parseFloat((disponivel + a_liberar).toFixed(2)),
+        moeda: 'BRL'
       });
-      req.on('error', reject);
-      req.end();
-    });
-    if (result._status === 200) {
-      const data = JSON.parse(result._body);
-      const disponivel = (data.amount && data.amount.value !== undefined) ? data.amount.value / 100 : 0;
-      res.json({ disponivel: parseFloat(disponivel.toFixed(2)), a_liberar: 0, total: parseFloat(disponivel.toFixed(2)), moeda: 'BRL' });
     } else {
-      // Balance API not available with this token (requires Connect OAuth scope)
-      res.json({ disponivel: null, a_liberar: null, total: null, moeda: 'BRL', nota: 'Saldo indisponivel - token sem permissao accounts.read' });
+      res.json({ disponivel: null, a_liberar: null, total: null, moeda: 'BRL', nota: 'Saldo indisponivel - status ' + result._status + ' - ' + xml.substring(0, 200) });
     }
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// GET /api/pagbank/volume
+// GET /api/pagbank/volume// GET /api/pagbank/volume
 app.get('/api/pagbank/volume', async (req, res) => {
   try {
     const { inicio, fim, inicioDate, fimDate } = getPeriodoPagbank(req);
@@ -680,7 +671,7 @@ app.get('/api/pagbank/volume', async (req, res) => {
         liquido += tx.liquido;
         if (tx.metodo === 'pix') via_pix += tx.bruto;
         else if (tx.metodo === 'boleto') via_boleto += tx.bruto;
-        else if (tx.metodo === 'cartao') {
+        else if (tx.metodo === 'cartao' || tx.metodo === 'recorrente') {
           via_cartao += tx.bruto;
           if (tx.parcelas > 1) parcelado += tx.bruto;
         }
@@ -711,6 +702,7 @@ app.get('/api/pagbank/volume', async (req, res) => {
       via_cartao: parseFloat(via_cartao.toFixed(2)),
       parcelado: parseFloat(parcelado.toFixed(2)),
       periodo_anterior: parseFloat(periodo_anterior.toFixed(2)),
+      taxas: parseFloat((pago - liquido).toFixed(2)),
       total_transacoes: txs.length,
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
