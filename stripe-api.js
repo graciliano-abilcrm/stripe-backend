@@ -942,8 +942,8 @@ app.get('/api/ghl/cruzamento', async (req, res) => {
     const locations = await ghlGetAllLocations();
 
     // 2. Busca TODOS os clientes Stripe com assinaturas ativas
-    const stripeCustomers = await stripeListAll('/customers', { limit: 100 });
-    const stripeSubs = await stripeListAll('/subscriptions', { limit: 100, status: 'active' });
+    const stripeCustomers = await stripeListAll('customers', { limit: 100 });
+    const stripeSubs = await stripeListAll('subscriptions', { limit: 100, status: 'active' });
 
     // Monta mapa: customerId -> subscription info
     const subByCustomer = {};
