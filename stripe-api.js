@@ -577,12 +577,18 @@ function getPeriodoPagbank(req) {
     inicio = new Date(agora.getFullYear(), agora.getMonth(), 1);
     fim = new Date(agora.getFullYear(), agora.getMonth() + 1, 0, 23, 59, 59);
   }
-  // PagSeguro nao aceita datas futuras — limitar fim ao momento atual
-  if (fim > agora) fim = new Date(agora);
+  // PagSeguro usa BRT (UTC-3). Servidor roda em UTC.
+  // Converter para BRT subtraindo 3h, e limitar fim ao agora em BRT
   const toPS = (d) => {
+    const brt = new Date(d.getTime() - 3 * 60 * 60 * 1000); // UTC -> BRT
     const pad = (n) => String(n).padStart(2, '0');
-    return d.getFullYear() + '-' + pad(d.getMonth()+1) + '-' + pad(d.getDate()) + 'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+    return brt.getFullYear() + '-' + pad(brt.getMonth()+1) + '-' + pad(brt.getDate()) + 'T' + pad(brt.getHours()) + ':' + pad(brt.getMinutes());
   };
+  // Limitar fim ao agora (em BRT) para evitar erro 13009
+  const agoraBRT = new Date(agora.getTime() - 3 * 60 * 60 * 1000);
+  if (new Date(fim.getTime() - 3 * 60 * 60 * 1000) > agoraBRT) {
+    fim = new Date(agora.getTime() - 2 * 60 * 1000); // agora menos 2 min de margem
+  }
   return { inicio: toPS(inicio), fim: toPS(fim), inicioDate: inicio, fimDate: fim };
 }
 
