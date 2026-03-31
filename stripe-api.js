@@ -598,6 +598,7 @@ function parseTx(txXml) {
   const methodMap = { '1': 'cartao', '2': 'boleto', '3': 'debito', '4': 'saldo', '7': 'pix', '11': 'recorrente' };
   const statusMap = { '1': 'aguardando', '2': 'em_analise', '3': 'pago', '4': 'disponivel', '5': 'em_disputa', '6': 'devolvido', '7': 'cancelado', '8': 'chargeback', '9': 'retencao' };
   const senderMatch = txXml.match(/<sender[^>]*>([\s\S]*?)<\/sender>/);
+  const itemMatch = txXml.match(/<item[^>]*>([\s\S]*?)<\/item>/);
   return {
     id: xmlVal(txXml, 'code'),
     bruto: parseFloat(xmlVal(txXml, 'grossAmount') || '0'),
@@ -609,6 +610,8 @@ function parseTx(txXml) {
     nome: senderMatch ? xmlVal(senderMatch[1], 'name') : 'N/A',
     email: senderMatch ? xmlVal(senderMatch[1], 'email') : 'N/A',
     data: xmlVal(txXml, 'date').substring(0, 10),
+    referencia: xmlVal(txXml, 'reference') || null,
+    link_pagamento: itemMatch ? xmlVal(itemMatch[1], 'description') || null : null,
   };
 }
 
