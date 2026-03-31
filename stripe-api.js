@@ -968,25 +968,41 @@ app.get('/api/ghl/cruzamento', async (req, res) => {
       sub: subByCustomer[c.id] || null,
     })).filter(c => c.sub !== null); // so quem tem assinatura ativa
 
-    // 3. Cruza cada subconta GHL com Stripe (por email ou nome)
+    // 3. Cruza cada subconta GHL com Stripe
+    // Cada cliente Stripe so pode ser matched UMA vez (evita falsos positivos)
+    const matchedStripeIds = new Set();
+
     const resultado = locations.map(loc => {
       const nomeGHL = loc.name || '';
-      const emailGHL = (loc.email || '').toLowerCase().trim();
 
-      // Tenta match por email primeiro (mais confiavel)
-      let match = emailGHL
-        ? stripeClientes.find(c => c.email.toLowerCase().trim() === emailGHL)
-        : null;
+      // Match exato por nome normalizado
+      let match = stripeClientes.find(c =>
+        !matchedStripeIds.has(c.id) &&
+        normalizeName(c.nome) === normalizeName(nomeGHL) &&
+        normalizeName(nomeGHL).length >= 3
+      );
 
-      // Se nao achou por email, tenta por nome (fuzzy)
+      // Fuzzy: substring de 6+ chars OU 2+ palavras de 5+ chars em comum
       if (!match) {
-        match = stripeClientes.find(c => nomesSimilares(c.nome, nomeGHL));
+        match = stripeClientes.find(c => {
+          if (matchedStripeIds.has(c.id)) return false;
+          const na = normalizeName(c.nome);
+          const nb = normalizeName(nomeGHL);
+          if (!na || !nb || na.length < 4 || nb.length < 4) return false;
+          const shorter = na.length < nb.length ? na : nb;
+          const longer  = na.length < nb.length ? nb : na;
+          if (shorter.length >= 6 && longer.includes(shorter)) return true;
+          const wordsA = na.split(' ').filter(w => w.length >= 5);
+          const wordsB = new Set(nb.split(' ').filter(w => w.length >= 5));
+          return wordsA.filter(w => wordsB.has(w)).length >= 2;
+        });
       }
+
+      if (match) matchedStripeIds.add(match.id);
 
       return {
         ghl_id: loc.id,
         nome: nomeGHL,
-        email: emailGHL || null,
         stripe_encontrado: !!match,
         stripe_customer_id: match ? match.id : null,
         stripe_email: match ? match.email : null,
@@ -996,6 +1012,9 @@ app.get('/api/ghl/cruzamento', async (req, res) => {
         alerta: !match ? 'SEM_COBRANCA' : null,
       };
     });
+
+    // Stripe ativos nao matcheados a nenhuma subconta GHL
+    const stripeNaoMatcheados = stripeClientes.filter(c => !matchedStripeIds.has(c.id));
 
     // Ordena: primeiro sem cobranca (alertas), depois por receita decrescente
     resultado.sort((a, b) => {
@@ -1009,10 +1028,18 @@ app.get('/api/ghl/cruzamento', async (req, res) => {
 
     res.json({
       total_subcontas_ghl: locations.length,
+      total_stripe_ativos: stripeClientes.length,
       com_cobranca_stripe: comCobranca.length,
       sem_cobranca_stripe: semCobranca.length,
       receita_total_mensal: parseFloat(receitaTotal.toFixed(2)),
       subcontas: resultado,
+      stripe_sem_match_ghl: stripeNaoMatcheados.map(c => ({
+        stripe_id: c.id,
+        nome: c.nome,
+        email: c.email,
+        receita_mensal: c.sub ? c.sub.valor : 0,
+        plano: c.sub ? c.sub.plano : null,
+      })),
       gerado_em: new Date().toISOString(),
     });
   } catch (err) { res.status(500).json({ error: err.message, stack: err.stack }); }
