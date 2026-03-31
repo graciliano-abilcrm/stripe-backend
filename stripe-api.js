@@ -541,7 +541,7 @@ function xmlVal(xml, tag) {
 
 function xmlAll(xml, tag) {
   const results = [];
-  const re = new RegExp('<' + tag + '(?![a-zA-Z])[^>]*>([\s\S]*?)<\/' + tag + '>', 'g');
+  const re = new RegExp('<' + tag + '(?![a-zA-Z])[^>]*>([\\s\\S]*?)<\\/' + tag + '>', 'g');
   let m;
   while ((m = re.exec(xml)) !== null) results.push(m[1]);
   return results;
