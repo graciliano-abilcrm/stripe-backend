@@ -858,38 +858,35 @@ app.get('/api/ghl/custo-subcontas', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// GET /api/ghl/debug — testa endpoints de billing GHL
+// GET /api/ghl/debug — inspeciona dados de company e subcontas
 app.get('/api/ghl/debug', async (req, res) => {
   try {
-    // Primeiro pega uma subconta para testar paths com locationId
-    const locsR = await ghlRequest('/locations/search?limit=3');
+    const locsR = await ghlRequest('/locations/search?limit=100');
     const locs = locsR.body.locations || [];
-    const locId = locs[0] ? locs[0].id : 'NONE';
     const companyId = locs[0] ? locs[0].companyId : 'NONE';
 
-    const paths = [
-      '/saas/subscriptions/' + locId,
-      '/saas/subscription/' + locId,
-      '/saas/location/' + locId + '/subscription',
-      '/companies/' + companyId + '/billing',
-      '/companies/' + companyId,
-      '/saas/revenue?locationId=' + locId,
-      '/payments/subscriptions?locationId=' + locId + '&limit=3',
-      '/payments/transactions?locationId=' + locId + '&limit=3',
-      '/locations/' + locId + '/usage',
-      '/locations/' + locId + '/billing',
-    ];
-    const results = await Promise.all(paths.map(async (p) => {
-      const r = await ghlRequest(p);
-      return { path: p, status: r.status, sample: JSON.stringify(r.body).substring(0, 200) };
-    }));
+    // Get company info and try saas with version header
+    const [compR, saasR, locsFullR] = await Promise.all([
+      ghlRequest('/companies/' + companyId),
+      ghlRequest('/saas/subscriptions?companyId=' + companyId + '&limit=10'),
+      ghlRequest('/locations/search?limit=100&skip=0'),
+    ]);
+
     res.json({
-      key_configured: !!GHL_AGENCY_KEY,
-      first_location: { id: locId, companyId, name: locs[0] ? locs[0].name : 'N/A' },
-      results,
+      total_locations: locs.length,
+      company_status: compR.status,
+      company_keys: compR.status === 200 ? Object.keys(compR.body) : [],
+      company_billing: compR.status === 200 ? JSON.stringify(compR.body).substring(0, 500) : 'N/A',
+      saas_status: saasR.status,
+      saas_sample: JSON.stringify(saasR.body).substring(0, 300),
+      locations_sample: locs.slice(0,3).map(l => ({
+        id: l.id, name: l.name, plan: l.plan, saasSubscriptionStatus: l.saasSubscriptionStatus,
+        trialEndDate: l.trialEndDate, suspended: l.suspended,
+      })),
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
 
 app.listen(PORT, () => {
   console.log(`Stripe API backend rodando na porta ${PORT}`);
