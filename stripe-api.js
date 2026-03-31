@@ -528,55 +528,43 @@ app.get('/api/stripe/clientes/novos', async (req, res) => {
 });
 
 // ============================================================
-// PAGBANK INTEGRATION
+// PAGBANK INTEGRATION (PagSeguro Legacy API v3 — XML)
 // ============================================================
 
 const PAGBANK_TOKEN = process.env.PAGBANK_TOKEN || '';
-const PAGBANK_ENV = process.env.PAGBANK_ENV || 'production';
-const PAGBANK_HOST = PAGBANK_ENV === 'sandbox' ? 'sandbox.api.pagseguro.com' : 'api.pagseguro.com';
+const PAGBANK_EMAIL = process.env.PAGBANK_EMAIL || '';
 
-function pagbankRequest(path, queryParams = {}) {
+function xmlVal(xml, tag) {
+  const m = xml.match(new RegExp('<' + tag + '[^>]*>([^<]*)<\/' + tag + '>'));
+  return m ? m[1].trim() : '';
+}
+
+function xmlAll(xml, tag) {
+  const results = [];
+  const re = new RegExp('<' + tag + '[^>]*>([\s\S]*?)<\/' + tag + '>', 'g');
+  let m;
+  while ((m = re.exec(xml)) !== null) results.push(m[1]);
+  return results;
+}
+
+function pagbankLegacyRequest(path, queryParams = {}) {
   return new Promise((resolve, reject) => {
-    const qs = new URLSearchParams(queryParams).toString();
-    const fullPath = qs ? `${path}?${qs}` : path;
+    const params = { email: PAGBANK_EMAIL, token: PAGBANK_TOKEN, ...queryParams };
+    const qs = new URLSearchParams(params).toString();
     const options = {
-      hostname: PAGBANK_HOST,
-      path: fullPath,
+      hostname: 'ws.pagseguro.uol.com.br',
+      path: path + '?' + qs,
       method: 'GET',
-      headers: {
-        Authorization: `Bearer ${PAGBANK_TOKEN}`,
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Accept': 'application/xml;charset=ISO-8859-1' },
     };
     const req = https.request(options, (res) => {
       let data = '';
       res.on('data', (chunk) => (data += chunk));
-      res.on('end', () => {
-        try { resolve(JSON.parse(data)); }
-        catch (e) { reject(new Error('Erro ao parsear resposta do PagBank')); }
-      });
+      res.on('end', () => resolve({ _body: data, _status: res.statusCode }));
     });
     req.on('error', reject);
     req.end();
   });
-}
-
-async function pagbankListAll(path, queryParams = {}) {
-  let all = [];
-  let offset = 0;
-  const limit = 100;
-  while (true) {
-    const currentParams = { ...queryParams, limit, offset };
-    const result = await pagbankRequest(path, currentParams);
-    if (result.error_messages || result.error) {
-      throw new Error(JSON.stringify(result.error_messages || result.error));
-    }
-    const items = result.orders || result.items || [];
-    all = all.concat(items);
-    if (items.length < limit) break;
-    offset += limit;
-  }
-  return all;
 }
 
 function getPeriodoPagbank(req) {
@@ -589,23 +577,66 @@ function getPeriodoPagbank(req) {
     inicio = new Date(agora.getFullYear(), agora.getMonth(), 1);
     fim = new Date(agora.getFullYear(), agora.getMonth() + 1, 0, 23, 59, 59);
   }
-  const toISO = (d) => {
+  const toPS = (d) => {
     const pad = (n) => String(n).padStart(2, '0');
-    return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}-03:00`;
+    return d.getFullYear() + '-' + pad(d.getMonth()+1) + '-' + pad(d.getDate()) + 'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
   };
-  return { inicio: toISO(inicio), fim: toISO(fim) };
+  return { inicio: toPS(inicio), fim: toPS(fim), inicioDate: inicio, fimDate: fim };
+}
+
+function parseTx(txXml) {
+  const pmMatch = txXml.match(/<paymentMethod[^>]*>([\s\S]*?)<\/paymentMethod>/);
+  const pmType = pmMatch ? xmlVal(pmMatch[1], 'type') : '';
+  const methodMap = { '1': 'cartao', '2': 'boleto', '3': 'debito', '4': 'saldo', '7': 'pix', '11': 'recorrente' };
+  const statusMap = { '1': 'aguardando', '2': 'em_analise', '3': 'pago', '4': 'disponivel', '5': 'em_disputa', '6': 'devolvido', '7': 'cancelado', '8': 'chargeback', '9': 'retencao' };
+  const senderMatch = txXml.match(/<sender[^>]*>([\s\S]*?)<\/sender>/);
+  return {
+    id: xmlVal(txXml, 'code'),
+    bruto: parseFloat(xmlVal(txXml, 'grossAmount') || '0'),
+    liquido: parseFloat(xmlVal(txXml, 'netAmount') || '0'),
+    taxa: parseFloat(xmlVal(txXml, 'feeAmount') || '0'),
+    status: statusMap[xmlVal(txXml, 'status')] || xmlVal(txXml, 'status'),
+    metodo: methodMap[pmType] || 'outro',
+    parcelas: parseInt(xmlVal(txXml, 'installmentCount') || '1'),
+    nome: senderMatch ? xmlVal(senderMatch[1], 'name') : 'N/A',
+    email: senderMatch ? xmlVal(senderMatch[1], 'email') : 'N/A',
+    data: xmlVal(txXml, 'date').substring(0, 10),
+  };
+}
+
+async function pagbankListAllTx(initialDate, finalDate) {
+  let all = [];
+  let page = 1;
+  let totalPages = 1;
+  while (page <= totalPages) {
+    const result = await pagbankLegacyRequest('/v3/transactions', {
+      initialDate, finalDate, maxPageResults: 100, page,
+    });
+    const xml = result._body;
+    if (!xml.includes('<transactionSearchResult>')) {
+      throw new Error('PagBank API error (' + result._status + '): ' + xml.substring(0, 300));
+    }
+    const txXmls = xmlAll(xml, 'transaction');
+    all = all.concat(txXmls.map(parseTx));
+    const tp = parseInt(xmlVal(xml, 'totalPages') || '1');
+    totalPages = tp > 0 ? tp : 1;
+    page++;
+  }
+  return all;
 }
 
 // GET /api/pagbank/saldo
 app.get('/api/pagbank/saldo', async (req, res) => {
   try {
-    const data = await pagbankRequest('/accounts/balance');
-    const disponivel = (data.amount?.available?.value || 0) / 100;
-    const reservado = (data.amount?.reserved?.value || 0) / 100;
+    const result = await pagbankLegacyRequest('/v2/balance');
+    const xml = result._body;
+    const quantities = xmlAll(xml, 'quantity');
+    const disponivel = parseFloat(quantities[0] || '0');
+    const a_liberar = parseFloat(quantities[1] || '0');
     res.json({
-      disponivel: parseFloat(disponivel.toFixed(2)),
-      reservado: parseFloat(reservado.toFixed(2)),
-      total: parseFloat((disponivel + reservado).toFixed(2)),
+      disponivel,
+      a_liberar,
+      total: parseFloat((disponivel + a_liberar).toFixed(2)),
       moeda: 'BRL',
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -614,58 +645,51 @@ app.get('/api/pagbank/saldo', async (req, res) => {
 // GET /api/pagbank/volume
 app.get('/api/pagbank/volume', async (req, res) => {
   try {
-    const { inicio, fim } = getPeriodoPagbank(req);
-    const orders = await pagbankListAll('/orders', {
-      'created_at[gte]': inicio,
-      'created_at[lte]': fim,
-    });
-
-    let pago = 0, pendente = 0, cancelado = 0, via_pix = 0, via_boleto = 0;
-    for (const order of orders) {
-      for (const charge of (order.charges || [])) {
-        const valor = (charge.amount?.value || 0) / 100;
-        const metodo = (charge.payment_method?.type || '').toUpperCase();
-        const status = (charge.status || '').toUpperCase();
-        if (status === 'PAID') {
-          pago += valor;
-          if (metodo === 'PIX') via_pix += valor;
-          if (metodo === 'BOLETO') via_boleto += valor;
-        } else if (['WAITING', 'PENDING', 'IN_ANALYSIS'].includes(status)) {
-          pendente += valor;
-        } else if (['CANCELED', 'DECLINED', 'UNAUTHORIZED', 'CHARGEBACK'].includes(status)) {
-          cancelado += valor;
+    const { inicio, fim, inicioDate, fimDate } = getPeriodoPagbank(req);
+    const txs = await pagbankListAllTx(inicio, fim);
+    let pago = 0, pendente = 0, cancelado = 0, liquido = 0;
+    let via_pix = 0, via_boleto = 0, via_cartao = 0, parcelado = 0;
+    for (const tx of txs) {
+      const isPago = ['pago', 'disponivel'].includes(tx.status);
+      const isPendente = ['aguardando', 'em_analise'].includes(tx.status);
+      const isCancelado = ['cancelado', 'devolvido', 'chargeback'].includes(tx.status);
+      if (isPago) {
+        pago += tx.bruto;
+        liquido += tx.liquido;
+        if (tx.metodo === 'pix') via_pix += tx.bruto;
+        else if (tx.metodo === 'boleto') via_boleto += tx.bruto;
+        else if (tx.metodo === 'cartao') {
+          via_cartao += tx.bruto;
+          if (tx.parcelas > 1) parcelado += tx.bruto;
         }
+      } else if (isPendente) {
+        pendente += tx.bruto;
+      } else if (isCancelado) {
+        cancelado += tx.bruto;
       }
     }
-
-    const toISO = (d) => {
+    const toPS = (d) => {
       const pad = (n) => String(n).padStart(2, '0');
-      return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}-03:00`;
+      return d.getFullYear() + '-' + pad(d.getMonth()+1) + '-' + pad(d.getDate()) + 'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
     };
-    const inicioDate = new Date(inicio);
-    inicioDate.setMonth(inicioDate.getMonth() - 1);
-    const fimDate = new Date(fim);
-    fimDate.setMonth(fimDate.getMonth() - 1);
-    const ordersAnterior = await pagbankListAll('/orders', {
-      'created_at[gte]': toISO(inicioDate),
-      'created_at[lte]': toISO(fimDate),
-    });
+    const inicioAnterior = new Date(inicioDate); inicioAnterior.setMonth(inicioAnterior.getMonth() - 1);
+    const fimAnterior = new Date(fimDate); fimAnterior.setMonth(fimAnterior.getMonth() - 1);
+    const txsAnterior = await pagbankListAllTx(toPS(inicioAnterior), toPS(fimAnterior));
     let periodo_anterior = 0;
-    for (const order of ordersAnterior) {
-      for (const charge of (order.charges || [])) {
-        if ((charge.status || '').toUpperCase() === 'PAID') {
-          periodo_anterior += (charge.amount?.value || 0) / 100;
-        }
-      }
+    for (const tx of txsAnterior) {
+      if (['pago', 'disponivel'].includes(tx.status)) periodo_anterior += tx.bruto;
     }
-
     res.json({
       pago: parseFloat(pago.toFixed(2)),
+      liquido: parseFloat(liquido.toFixed(2)),
       pendente: parseFloat(pendente.toFixed(2)),
       cancelado: parseFloat(cancelado.toFixed(2)),
       via_pix: parseFloat(via_pix.toFixed(2)),
       via_boleto: parseFloat(via_boleto.toFixed(2)),
+      via_cartao: parseFloat(via_cartao.toFixed(2)),
+      parcelado: parseFloat(parcelado.toFixed(2)),
       periodo_anterior: parseFloat(periodo_anterior.toFixed(2)),
+      total_transacoes: txs.length,
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -674,74 +698,10 @@ app.get('/api/pagbank/volume', async (req, res) => {
 app.get('/api/pagbank/transacoes', async (req, res) => {
   try {
     const { inicio, fim } = getPeriodoPagbank(req);
-    const orders = await pagbankListAll('/orders', {
-      'created_at[gte]': inicio,
-      'created_at[lte]': fim,
-    });
-    const transacoes = [];
-    for (const order of orders) {
-      for (const charge of (order.charges || [])) {
-        transacoes.push({
-          id: charge.id,
-          order_id: order.id,
-          reference: order.reference_id || '',
-          valor: (charge.amount?.value || 0) / 100,
-          status: charge.status || 'N/A',
-          metodo: charge.payment_method?.type || 'N/A',
-          nome: order.customer?.name || 'N/A',
-          email: order.customer?.email || 'N/A',
-          data_criacao: new Date(order.created_at).toLocaleDateString('pt-BR'),
-          data_pagamento: charge.paid_at
-            ? new Date(charge.paid_at).toLocaleDateString('pt-BR')
-            : null,
-        });
-      }
-    }
-    transacoes.sort((a, b) => new Date(b.data_criacao) - new Date(a.data_criacao));
-    res.json({ transacoes, total: transacoes.length });
+    const txs = await pagbankListAllTx(inicio, fim);
+    txs.sort((a, b) => new Date(b.data) - new Date(a.data));
+    res.json({ transacoes: txs, total: txs.length });
   } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// GET /api/pagbank/repasses
-app.get('/api/pagbank/repasses', async (req, res) => {
-  try {
-    const { inicio, fim } = getPeriodoPagbank(req);
-    const result = await pagbankRequest('/transfers', {
-      'created_at[gte]': inicio,
-      'created_at[lte]': fim,
-    });
-    const transferencias = (result.items || []).map(t => ({
-      id: t.id,
-      valor: (t.amount?.value || 0) / 100,
-      status: t.status || 'N/A',
-      banco: t.account_bank?.bank_code || 'N/A',
-      data_criacao: t.created_at
-        ? new Date(t.created_at).toLocaleDateString('pt-BR')
-        : 'N/A',
-    }));
-    const total_realizado = transferencias
-      .filter(t => t.status === 'SUCCEEDED')
-      .reduce((sum, t) => sum + t.valor, 0);
-    const total_pendente = transferencias
-      .filter(t => ['WAITING', 'IN_ANALYSIS'].includes(t.status))
-      .reduce((sum, t) => sum + t.valor, 0);
-    res.json({
-      transferencias,
-      total_realizado: parseFloat(total_realizado.toFixed(2)),
-      total_pendente: parseFloat(total_pendente.toFixed(2)),
-    });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// GET /api/pagbank/debug — testa múltiplos endpoints PagBank
-app.get('/api/pagbank/debug', async (req, res) => {
-  const results = {};
-  const endpoints = ['/charges', '/statements', '/account/statements', '/transfers', '/pix/payment'];
-  for (const ep of endpoints) {
-    try { results[ep] = await pagbankRequest(ep); }
-    catch (e) { results[ep] = { error: e.message }; }
-  }
-  res.json({ host: PAGBANK_HOST, env: PAGBANK_ENV, results });
 });
 
 app.listen(PORT, () => {
