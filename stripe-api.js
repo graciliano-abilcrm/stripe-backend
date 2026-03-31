@@ -888,6 +888,136 @@ app.get('/api/ghl/debug', async (req, res) => {
 });
 
 
+
+// ============================================================
+// GHL — Busca TODAS as subcontas com paginacao automatica
+// Sempre dinamico: novas subcontas aparecem automaticamente
+// ============================================================
+
+async function ghlGetAllLocations() {
+  const all = [];
+  let skip = 0;
+  const limit = 100;
+  while (true) {
+    const r = await ghlRequest('/locations/search?limit=' + limit + '&skip=' + skip);
+    const locs = (r.body && r.body.locations) ? r.body.locations : [];
+    all.push(...locs);
+    if (locs.length < limit) break; // ultima pagina
+    skip += limit;
+  }
+  return all;
+}
+
+// Normaliza nomes para comparacao fuzzy (remove acentos, espacos extras, case)
+function normalizeName(str) {
+  if (!str) return '';
+  return str.toLowerCase()
+    .normalize('NFD').replace(/[̀-ͯ]/g, '') // remove acentos
+    .replace(/[^a-z0-9s]/g, '')                      // remove especiais
+    .replace(/s+/g, ' ').trim();
+}
+
+// Verifica se dois nomes sao suficientemente similares
+function nomesSimilares(a, b) {
+  const na = normalizeName(a);
+  const nb = normalizeName(b);
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  // Checa se um contem o outro (min 5 chars)
+  const shorter = na.length < nb.length ? na : nb;
+  const longer = na.length < nb.length ? nb : na;
+  if (shorter.length >= 5 && longer.includes(shorter)) return true;
+  // Palavras em comum (>=2 palavras de >=4 chars)
+  const wordsA = na.split(' ').filter(w => w.length >= 4);
+  const wordsB = new Set(nb.split(' ').filter(w => w.length >= 4));
+  const common = wordsA.filter(w => wordsB.has(w));
+  return common.length >= 2;
+}
+
+// GET /api/ghl/cruzamento — cruza subcontas GHL x assinaturas Stripe
+// Sempre busca dados em tempo real — novas subcontas aparecem automaticamente
+app.get('/api/ghl/cruzamento', async (req, res) => {
+  try {
+    // 1. Busca TODAS as subcontas GHL (paginado automaticamente)
+    const locations = await ghlGetAllLocations();
+
+    // 2. Busca TODOS os clientes Stripe com assinaturas ativas
+    const stripeCustomers = await stripeListAll('/v1/customers', { limit: 100, expand: [] });
+    const stripeSubs = await stripeListAll('/v1/subscriptions', { limit: 100, status: 'active' });
+
+    // Monta mapa: customerId -> subscription info
+    const subByCustomer = {};
+    for (const sub of stripeSubs) {
+      subByCustomer[sub.customer] = {
+        id: sub.id,
+        status: sub.status,
+        valor: sub.items && sub.items.data[0] ? sub.items.data[0].price.unit_amount / 100 : 0,
+        moeda: sub.currency ? sub.currency.toUpperCase() : 'BRL',
+        plano: sub.items && sub.items.data[0] && sub.items.data[0].price.nickname
+          ? sub.items.data[0].price.nickname
+          : (sub.items && sub.items.data[0] ? sub.items.data[0].price.id : 'N/A'),
+        inicio: sub.start_date ? new Date(sub.start_date * 1000).toISOString().substring(0, 10) : null,
+      };
+    }
+
+    // Monta lista de clientes Stripe com email e nome
+    const stripeClientes = stripeCustomers.map(c => ({
+      id: c.id,
+      nome: c.name || '',
+      email: c.email || '',
+      sub: subByCustomer[c.id] || null,
+    })).filter(c => c.sub !== null); // so quem tem assinatura ativa
+
+    // 3. Cruza cada subconta GHL com Stripe (por email ou nome)
+    const resultado = locations.map(loc => {
+      const nomeGHL = loc.name || '';
+      const emailGHL = (loc.email || '').toLowerCase().trim();
+
+      // Tenta match por email primeiro (mais confiavel)
+      let match = emailGHL
+        ? stripeClientes.find(c => c.email.toLowerCase().trim() === emailGHL)
+        : null;
+
+      // Se nao achou por email, tenta por nome (fuzzy)
+      if (!match) {
+        match = stripeClientes.find(c => nomesSimilares(c.nome, nomeGHL));
+      }
+
+      return {
+        ghl_id: loc.id,
+        nome: nomeGHL,
+        email: emailGHL || null,
+        stripe_encontrado: !!match,
+        stripe_customer_id: match ? match.id : null,
+        stripe_email: match ? match.email : null,
+        stripe_nome_match: match ? match.nome : null,
+        assinatura: match ? match.sub : null,
+        receita_mensal: match && match.sub ? match.sub.valor : 0,
+        alerta: !match ? 'SEM_COBRANCA' : null,
+      };
+    });
+
+    // Ordena: primeiro sem cobranca (alertas), depois por receita decrescente
+    resultado.sort((a, b) => {
+      if (a.stripe_encontrado !== b.stripe_encontrado) return a.stripe_encontrado ? 1 : -1;
+      return b.receita_mensal - a.receita_mensal;
+    });
+
+    const semCobranca = resultado.filter(r => !r.stripe_encontrado);
+    const comCobranca = resultado.filter(r => r.stripe_encontrado);
+    const receitaTotal = comCobranca.reduce((s, r) => s + r.receita_mensal, 0);
+
+    res.json({
+      total_subcontas_ghl: locations.length,
+      com_cobranca_stripe: comCobranca.length,
+      sem_cobranca_stripe: semCobranca.length,
+      receita_total_mensal: parseFloat(receitaTotal.toFixed(2)),
+      subcontas: resultado,
+      gerado_em: new Date().toISOString(),
+    });
+  } catch (err) { res.status(500).json({ error: err.message, stack: err.stack }); }
+});
+
 app.listen(PORT, () => {
   console.log(`Stripe API backend rodando na porta ${PORT}`);
 });
