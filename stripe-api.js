@@ -858,26 +858,34 @@ app.get('/api/ghl/custo-subcontas', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// GET /api/ghl/debug — testa multiplos endpoints para descobrir paths corretos
+// GET /api/ghl/debug — testa endpoints de billing GHL
 app.get('/api/ghl/debug', async (req, res) => {
   try {
+    // Primeiro pega uma subconta para testar paths com locationId
+    const locsR = await ghlRequest('/locations/search?limit=3');
+    const locs = locsR.body.locations || [];
+    const locId = locs[0] ? locs[0].id : 'NONE';
+    const companyId = locs[0] ? locs[0].companyId : 'NONE';
+
     const paths = [
-      '/locations/search?limit=5',
-      '/locations/?limit=5',
-      '/saas/revenue',
-      '/saas/agency-billing',
-      '/v1/agency/billing',
-      '/v1/locations/?limit=5',
-      '/v2/locations/search?limit=5',
-      '/payments/subscriptions?limit=5',
+      '/saas/subscriptions/' + locId,
+      '/saas/subscription/' + locId,
+      '/saas/location/' + locId + '/subscription',
+      '/companies/' + companyId + '/billing',
+      '/companies/' + companyId,
+      '/saas/revenue?locationId=' + locId,
+      '/payments/subscriptions?locationId=' + locId + '&limit=3',
+      '/payments/transactions?locationId=' + locId + '&limit=3',
+      '/locations/' + locId + '/usage',
+      '/locations/' + locId + '/billing',
     ];
     const results = await Promise.all(paths.map(async (p) => {
       const r = await ghlRequest(p);
-      return { path: p, status: r.status, sample: JSON.stringify(r.body).substring(0, 150) };
+      return { path: p, status: r.status, sample: JSON.stringify(r.body).substring(0, 200) };
     }));
     res.json({
       key_configured: !!GHL_AGENCY_KEY,
-      key_prefix: GHL_AGENCY_KEY.substring(0, 12),
+      first_location: { id: locId, companyId, name: locs[0] ? locs[0].name : 'N/A' },
       results,
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
