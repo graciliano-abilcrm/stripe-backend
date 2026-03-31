@@ -633,21 +633,32 @@ async function pagbankListAllTx(initialDate, finalDate) {
   return all;
 }
 
-// GET /api/pagbank/saldo
+// GET /api/pagbank/saldo — usa PagBank Connect API (legacy nao tem balance)
 app.get('/api/pagbank/saldo', async (req, res) => {
   try {
-    const result = await pagbankLegacyRequest('/pagseguro-api/v2/balance');
-    const xml = result._body;
-    const quantities = xmlAll(xml, 'quantity');
-    const disponivel = parseFloat(quantities[0] || '0');
-    const a_liberar = parseFloat(quantities[1] || '0');
-    res.json({
-      disponivel,
-      a_liberar,
-      total: parseFloat((disponivel + a_liberar).toFixed(2)),
-      moeda: 'BRL',
+    const result = await new Promise((resolve, reject) => {
+      const options = {
+        hostname: 'api.pagseguro.com',
+        path: '/accounts/balance',
+        method: 'GET',
+        headers: { 'Authorization': 'Bearer ' + PAGBANK_TOKEN, 'Accept': 'application/json' },
+      };
+      const req = https.request(options, (r) => {
+        let data = '';
+        r.on('data', (chunk) => (data += chunk));
+        r.on('end', () => resolve({ _body: data, _status: r.statusCode }));
+      });
+      req.on('error', reject);
+      req.end();
     });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    if (result._status !== 200) throw new Error('PagBank saldo error (' + result._status + '): ' + result._body.substring(0, 300));
+    const data = JSON.parse(result._body);
+    // Response: { type, amount: { value } } — value in centavos
+    const disponivel = (data.amount && data.amount.value !== undefined) ? data.amount.value / 100 : 0;
+    res.json({ disponivel: parseFloat(disponivel.toFixed(2)), a_liberar: 0, total: parseFloat(disponivel.toFixed(2)), moeda: 'BRL', raw: data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // GET /api/pagbank/volume
@@ -715,25 +726,37 @@ app.get('/api/pagbank/transacoes', async (req, res) => {
 // GET /api/pagbank/debug — remover após testes
 app.get('/api/pagbank/debug', async (req, res) => {
   try {
-    const balanceResult = await pagbankLegacyRequest('/v2/balance');
+    // Test Connect API balance
+    const balanceResult = await new Promise((resolve, reject) => {
+      const options = {
+        hostname: 'api.pagseguro.com',
+        path: '/accounts/balance',
+        method: 'GET',
+        headers: { 'Authorization': 'Bearer ' + PAGBANK_TOKEN, 'Accept': 'application/json' },
+      };
+      const req = https.request(options, (r) => {
+        let data = '';
+        r.on('data', (chunk) => (data += chunk));
+        r.on('end', () => resolve({ _body: data, _status: r.statusCode }));
+      });
+      req.on('error', reject);
+      req.end();
+    });
     const agora = new Date();
     const pad = (n) => String(n).padStart(2, '0');
     const brt = new Date(agora.getTime() - 3 * 60 * 60 * 1000);
     const agoraStr = brt.getFullYear() + '-' + pad(brt.getMonth()+1) + '-' + pad(brt.getDate()) + 'T' + pad(brt.getHours()) + ':' + pad(brt.getMinutes());
     const inicioStr = brt.getFullYear() + '-' + pad(brt.getMonth()+1) + '-01T00:00';
     const txResult = await pagbankLegacyRequest('/v3/transactions', {
-      initialDate: inicioStr,
-      finalDate: agoraStr,
-      maxPageResults: 5,
-      page: 1,
+      initialDate: inicioStr, finalDate: agoraStr, maxPageResults: 5, page: 1,
     });
+    const txXmls = xmlAll(txResult._body, 'transaction');
     res.json({
-      email_configured: !!PAGBANK_EMAIL,
-      token_configured: !!PAGBANK_TOKEN,
       balance_status: balanceResult._status,
       balance_raw: balanceResult._body.substring(0, 500),
       tx_status: txResult._status,
-      tx_raw: txResult._body.substring(0, 800),
+      txXmls_count: txXmls.length,
+      parsed_transactions: txXmls.map(parseTx).slice(0, 3),
       dates_used: { inicio: inicioStr, fim: agoraStr },
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
