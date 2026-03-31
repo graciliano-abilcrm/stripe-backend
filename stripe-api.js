@@ -268,6 +268,7 @@ app.get('/api/stripe/pagamentos', async (req, res) => {
         tipo: c.invoice ? 'assinatura' : 'variavel',
         data: new Date(c.created * 1000).toLocaleDateString('pt-BR'),
         capturado: c.captured,
+        plataforma: 'stripe',
       };
     });
     res.json({ pagamentos, total: pagamentos.length });
@@ -612,6 +613,7 @@ function parseTx(txXml) {
     data: xmlVal(txXml, 'date').substring(0, 10),
     referencia: xmlVal(txXml, 'reference') || null,
     link_pagamento: itemMatch ? xmlVal(itemMatch[1], 'description') || null : null,
+    plataforma: 'pagbank',
   };
 }
 
@@ -724,6 +726,119 @@ app.get('/api/pagbank/transacoes', async (req, res) => {
     const txs = await pagbankListAllTx(inicio, fim);
     txs.sort((a, b) => new Date(b.data) - new Date(a.data));
     res.json({ transacoes: txs, total: txs.length });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/pagbank/repasses/projecao — projeção de liberação de fundos PagBank por semana
+// Prazos: PIX D+1, Boleto D+2, Cartão D+30
+app.get('/api/pagbank/repasses/projecao', async (req, res) => {
+  try {
+    // Busca últimos 90 dias para pegar tudo "a liberar" (status pago = aprovado não liberado)
+    const agora = new Date();
+    const brt = (d) => new Date(d.getTime() - 3 * 60 * 60 * 1000);
+    const pad = (n) => String(n).padStart(2, '0');
+    const toPS = (d) => {
+      const b = brt(d);
+      return b.getFullYear() + '-' + pad(b.getMonth()+1) + '-' + pad(b.getDate()) + 'T' + pad(b.getHours()) + ':' + pad(b.getMinutes());
+    };
+    const inicio90 = new Date(agora.getTime() - 90 * 24 * 60 * 60 * 1000);
+    const txs = await pagbankListAllTx(toPS(inicio90), toPS(new Date(agora.getTime() - 2 * 60 * 1000)));
+
+    // Apenas transações aprovadas mas ainda não liberadas (status 'pago' = code 3)
+    const pendentes = txs.filter(tx => tx.status === 'pago');
+
+    // Prazo de liberação por método (dias corridos)
+    const prazoMap = { pix: 1, boleto: 2, cartao: 30, recorrente: 30, debito: 1, saldo: 0, outro: 2 };
+
+    const weekMap = {};
+    let a_liberar_total = 0;
+
+    pendentes.forEach(tx => {
+      a_liberar_total += tx.liquido;
+      const prazo = prazoMap[tx.metodo] ?? 2;
+      const dataBase = new Date(tx.data + 'T12:00:00');
+      const liberacao = new Date(dataBase.getTime() + prazo * 24 * 60 * 60 * 1000);
+
+      // Início da semana (segunda-feira)
+      const day = liberacao.getDay();
+      const diff = (day === 0 ? -6 : 1 - day);
+      const weekStart = new Date(liberacao);
+      weekStart.setDate(liberacao.getDate() + diff);
+      weekStart.setHours(0, 0, 0, 0);
+      const weekEnd = new Date(weekStart);
+      weekEnd.setDate(weekStart.getDate() + 6);
+
+      const fmt = (d) => d.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' });
+      const key = 'Semana de ' + fmt(weekStart) + ' a ' + fmt(weekEnd);
+      if (!weekMap[key]) weekMap[key] = { semana: key, valor_previsto: 0, quantidade: 0, _sort: weekStart.getTime() };
+      weekMap[key].valor_previsto += tx.liquido;
+      weekMap[key].quantidade += 1;
+    });
+
+    const projecao = Object.values(weekMap)
+      .sort((a, b) => a._sort - b._sort)
+      .map(({ _sort, ...rest }) => ({ ...rest, valor_previsto: parseFloat(rest.valor_previsto.toFixed(2)) }));
+
+    const proximo_repasse = projecao.length > 0
+      ? { data_prevista: projecao[0].semana, valor: projecao[0].valor_previsto }
+      : { data_prevista: 'N/A', valor: 0 };
+
+    res.json({
+      a_liberar_total: parseFloat(a_liberar_total.toFixed(2)),
+      projecao,
+      proximo_repasse,
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/pagamentos — pagamentos unificados Stripe + PagBank
+app.get('/api/pagamentos', async (req, res) => {
+  try {
+    const { inicio, fim, inicioDate, fimDate } = getPeriodo(req);
+    const { inicio: inicioPB, fim: fimPB } = getPeriodoPagbank(req);
+
+    const [charges, txsPagbank] = await Promise.all([
+      stripeListAll('charges', { 'created[gte]': String(inicio), 'created[lte]': String(fim) }),
+      pagbankListAllTx(inicioPB, fimPB),
+    ]);
+
+    const stripe = charges.map(c => {
+      const match = c.description?.match(/Auto-Recharge for Sub-Account - (.+?) (?:of BRL|\d)/);
+      return {
+        id: c.id,
+        plataforma: 'stripe',
+        valor: (c.amount || 0) / 100,
+        status: c.status === 'succeeded' ? 'aprovado' : c.status === 'failed' ? 'falhou' : c.status,
+        email: c.billing_details?.email || 'N/A',
+        descricao: c.description || '',
+        subconta: match ? match[1].trim() : '',
+        tipo: c.invoice ? 'assinatura' : 'variavel',
+        metodo: c.payment_method_details?.type || 'cartao',
+        link_pagamento: null,
+        referencia: null,
+        data: new Date(c.created * 1000).toLocaleDateString('pt-BR'),
+        data_sort: c.created,
+      };
+    });
+
+    const pagbank = txsPagbank.map(tx => ({
+      id: tx.id,
+      plataforma: 'pagbank',
+      valor: tx.bruto,
+      status: tx.status === 'disponivel' || tx.status === 'pago' ? 'aprovado' : tx.status === 'cancelado' || tx.status === 'devolvido' ? 'falhou' : tx.status,
+      email: tx.email || 'N/A',
+      descricao: tx.link_pagamento || tx.referencia || '',
+      subconta: '',
+      tipo: tx.metodo === 'recorrente' ? 'assinatura' : 'variavel',
+      metodo: tx.metodo,
+      link_pagamento: tx.link_pagamento,
+      referencia: tx.referencia,
+      data: tx.data,
+      data_sort: new Date(tx.data).getTime() / 1000,
+    }));
+
+    const todos = [...stripe, ...pagbank].sort((a, b) => b.data_sort - a.data_sort);
+    res.json({ pagamentos: todos, total: todos.length, stripe: stripe.length, pagbank: pagbank.length });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
