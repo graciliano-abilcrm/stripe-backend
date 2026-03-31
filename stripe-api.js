@@ -662,13 +662,17 @@ app.get('/api/pagbank/volume', async (req, res) => {
     const txs = await pagbankListAllTx(inicio, fim);
     let pago = 0, pendente = 0, cancelado = 0, liquido = 0;
     let via_pix = 0, via_boleto = 0, via_cartao = 0, parcelado = 0;
+    let a_receber = 0; // status 'pago'(3) = aprovado mas ainda nao liberado ao vendedor
+
     for (const tx of txs) {
-      const isPago = ['pago', 'disponivel'].includes(tx.status);
+      const isAprovado = ['pago', 'disponivel'].includes(tx.status);
       const isPendente = ['aguardando', 'em_analise'].includes(tx.status);
       const isCancelado = ['cancelado', 'devolvido', 'chargeback'].includes(tx.status);
-      if (isPago) {
+
+      if (isAprovado) {
         pago += tx.bruto;
         liquido += tx.liquido;
+        if (tx.status === 'pago') a_receber += tx.liquido; // aprovado mas nao creditado ainda
         if (tx.metodo === 'pix') via_pix += tx.bruto;
         else if (tx.metodo === 'boleto') via_boleto += tx.bruto;
         else if (tx.metodo === 'cartao' || tx.metodo === 'recorrente') {
@@ -681,7 +685,8 @@ app.get('/api/pagbank/volume', async (req, res) => {
         cancelado += tx.bruto;
       }
     }
-    const toPS = (d) => {
+
+        const toPS = (d) => {
       const pad = (n) => String(n).padStart(2, '0');
       return d.getFullYear() + '-' + pad(d.getMonth()+1) + '-' + pad(d.getDate()) + 'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
     };
@@ -702,6 +707,7 @@ app.get('/api/pagbank/volume', async (req, res) => {
       via_cartao: parseFloat(via_cartao.toFixed(2)),
       parcelado: parseFloat(parcelado.toFixed(2)),
       periodo_anterior: parseFloat(periodo_anterior.toFixed(2)),
+      a_receber: parseFloat(a_receber.toFixed(2)),
       taxas: parseFloat((pago - liquido).toFixed(2)),
       total_transacoes: txs.length,
     });
