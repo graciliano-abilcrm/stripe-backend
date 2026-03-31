@@ -577,6 +577,8 @@ function getPeriodoPagbank(req) {
     inicio = new Date(agora.getFullYear(), agora.getMonth(), 1);
     fim = new Date(agora.getFullYear(), agora.getMonth() + 1, 0, 23, 59, 59);
   }
+  // PagSeguro nao aceita datas futuras — limitar fim ao momento atual
+  if (fim > agora) fim = new Date(agora);
   const toPS = (d) => {
     const pad = (n) => String(n).padStart(2, '0');
     return d.getFullYear() + '-' + pad(d.getMonth()+1) + '-' + pad(d.getDate()) + 'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
