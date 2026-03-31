@@ -712,6 +712,33 @@ app.get('/api/pagbank/transacoes', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// GET /api/pagbank/debug — remover após testes
+app.get('/api/pagbank/debug', async (req, res) => {
+  try {
+    const balanceResult = await pagbankLegacyRequest('/v2/balance');
+    const agora = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    const brt = new Date(agora.getTime() - 3 * 60 * 60 * 1000);
+    const agoraStr = brt.getFullYear() + '-' + pad(brt.getMonth()+1) + '-' + pad(brt.getDate()) + 'T' + pad(brt.getHours()) + ':' + pad(brt.getMinutes());
+    const inicioStr = brt.getFullYear() + '-' + pad(brt.getMonth()+1) + '-01T00:00';
+    const txResult = await pagbankLegacyRequest('/v3/transactions', {
+      initialDate: inicioStr,
+      finalDate: agoraStr,
+      maxPageResults: 5,
+      page: 1,
+    });
+    res.json({
+      email_configured: !!PAGBANK_EMAIL,
+      token_configured: !!PAGBANK_TOKEN,
+      balance_status: balanceResult._status,
+      balance_raw: balanceResult._body.substring(0, 500),
+      tx_status: txResult._status,
+      tx_raw: txResult._body.substring(0, 800),
+      dates_used: { inicio: inicioStr, fim: agoraStr },
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.listen(PORT, () => {
   console.log(`Stripe API backend rodando na porta ${PORT}`);
 });
