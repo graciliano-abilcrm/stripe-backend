@@ -611,7 +611,7 @@ async function fetchLinkNome(referencia) {
       linkNomeCache[referencia] = nome;
       return nome;
     }
-  } catch (e) { /* silencioso */ }
+  } catch (e) { console.error('[fetchLinkNome] erro:', e.message); }
   linkNomeCache[referencia] = null;
   return null;
 }
@@ -1298,6 +1298,18 @@ app.delete('/api/ghl/mapeamentos/:stripe_customer_id', (req, res) => {
   delete manualMappings[id];
   saveMappings(manualMappings);
   res.json({ ok: true, removido: id });
+});
+
+
+// DEBUG: test PagBank payment-requests API directly
+app.get('/api/debug/link', async (req, res) => {
+  const code = req.query.code || '81DTTkpzq';
+  try {
+    const result = await pagbankLegacyRequest('/v2/payment-requests/' + code);
+    res.json({ code, status: result._status, body: result._body.substring(0, 1000) });
+  } catch (e) {
+    res.json({ code, error: e.message });
+  }
 });
 
 app.listen(PORT, () => {
