@@ -931,6 +931,34 @@ app.get('/api/pagbank/debug', async (req, res) => {
         r.on('data', (chunk) => (data += chunk));
         r.on('end', () => resolve({ _body: data, _status: r.statusCode }));
       });
+
+// GET /api/pagbank/raw-tx — debug: retorna XML bruto para verificar campos
+app.get('/api/pagbank/raw-tx', async (req, res) => {
+  try {
+    const agora = new Date();
+    const brt = (d) => new Date(d.getTime() - 3 * 60 * 60 * 1000);
+    const pad = (n) => String(n).padStart(2, '0');
+    const toPS = (d) => { const b = brt(d); return b.getFullYear() + '-' + pad(b.getMonth()+1) + '-' + pad(b.getDate()) + 'T' + pad(b.getHours()) + ':' + pad(b.getMinutes()); };
+    const fim = new Date(agora.getTime() - 2 * 60 * 1000);
+    const inicio = new Date(agora.getTime() - 35 * 24 * 60 * 60 * 1000);
+    const result = await pagbankLegacyRequest('/v3/transactions', {
+      initialDate: toPS(inicio), finalDate: toPS(fim), maxPageResults: 3, page: 1,
+    });
+    const txXmls = xmlAll(result._body, 'transaction');
+    const firstTx = txXmls[0] || '';
+    const installMatch = firstTx.match(/<installmentCount[^>]*>[\s\S]*?<\/installmentCount>/);
+    const pmMatch2 = firstTx.match(/<paymentMethod[^>]*>[\s\S]*?<\/paymentMethod>/);
+    const senderMatch2 = firstTx.match(/<sender[^>]*>[\s\S]*?<\/sender>/);
+    res.json({
+      status: result._status,
+      total_txs: txXmls.length,
+      installmentCount_tag: installMatch ? installMatch[0] : 'NOT FOUND IN XML',
+      paymentMethod: pmMatch2 ? pmMatch2[0] : 'NOT FOUND',
+      sender: senderMatch2 ? senderMatch2[0] : 'NOT FOUND',
+      tx_snippet: firstTx.substring(0, 600),
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
       req.on('error', reject);
       req.end();
     });
