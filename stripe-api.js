@@ -455,6 +455,20 @@ app.get('/api/stripe/repasses', async (req, res) => {
   }
 });
 
+// GET /api/stripe/payouts-total — total de repasses que chegaram ao banco no periodo
+app.get('/api/stripe/payouts-total', async (req, res) => {
+  try {
+    const { inicio, fim } = getPeriodo(req);
+    const payouts = await stripeListAll('payouts', {
+      'arrival_date[gte]': String(inicio),
+      'arrival_date[lte]': String(fim),
+    });
+    const pagos = payouts.filter(p => p.status === 'paid');
+    const total = pagos.reduce((sum, p) => sum + (p.amount || 0), 0) / 100;
+    res.json({ total: parseFloat(total.toFixed(2)), count: pagos.length });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // GET /api/stripe/repasses/projecao
 app.get('/api/stripe/repasses/projecao', async (req, res) => {
   try {
@@ -769,6 +783,7 @@ app.get('/api/pagbank/volume', async (req, res) => {
       parcelado: parseFloat(parcelado.toFixed(2)),
       periodo_anterior: parseFloat(periodo_anterior.toFixed(2)),
       a_receber: parseFloat(a_receber.toFixed(2)),
+      ja_liberado: parseFloat((liquido - a_receber).toFixed(2)),
       taxas: parseFloat((pago - liquido).toFixed(2)),
       total_transacoes: txs.length,
     });
