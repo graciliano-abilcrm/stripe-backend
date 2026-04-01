@@ -608,8 +608,9 @@ function getPeriodoPagbank(req) {
     inicio = new Date(parseInt(req.query.start) * 1000);
     fim = new Date(parseInt(req.query.end) * 1000);
   } else {
-    inicio = new Date(agora.getFullYear(), agora.getMonth(), 1);
-    fim = new Date(agora.getFullYear(), agora.getMonth() + 1, 0, 23, 59, 59);
+    const brtNow = new Date(agora.getTime() - 3 * 60 * 60 * 1000);
+    inicio = new Date(Date.UTC(brtNow.getUTCFullYear(), brtNow.getUTCMonth(), 1, 3, 0, 0));
+    fim = new Date(Date.UTC(brtNow.getUTCFullYear(), brtNow.getUTCMonth() + 1, 1, 2, 59, 59));
   }
   // PagSeguro usa BRT (UTC-3). Servidor roda em UTC.
   // Converter para BRT subtraindo 3h, e limitar fim ao agora em BRT
