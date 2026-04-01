@@ -614,6 +614,7 @@ function getPeriodoPagbank(req) {
 
 // Cache em memória: referencia -> nome do link (evita chamadas repetidas)
 const linkNomeCache = {};
+const parcelasCache = {};
 
 // Busca o nome real do link de pagamento PagSeguro pelo código de referência
 // Endpoint: GET /v2/payment-requests/{code}
@@ -629,6 +630,7 @@ async function fetchLinkNome(referencia, txCode) {
       const itemMatch = result._body.match(/<item[^>]*>([\s\S]*?)<\/item>/);
       const nome = itemMatch ? xmlVal(itemMatch[1], 'description') || null : null;
       linkNomeCache[referencia] = nome;
+      if (txCode) parcelasCache[txCode] = parseInt(xmlVal(result._body, 'installmentCount') || '0') || null;
       return nome;
     }
   } catch (e) { console.error('[fetchLinkNome] erro:', e.message); }
@@ -789,6 +791,7 @@ app.get('/api/pagbank/transacoes', async (req, res) => {
       link_pagamento: linkNomeCache[tx.referencia] || tx.link_pagamento,
       descricao: linkNomeCache[tx.referencia] || tx.link_pagamento || null,
       tipo: classifyTipo(linkNomeCache[tx.referencia] || tx.link_pagamento, tx.bruto, tx.metodo, 'pagbank'),
+      parcelas: parcelasCache[tx.id] || tx.parcelas,
     }));
 
     res.json({ transacoes: enriquecidas, total: enriquecidas.length });
