@@ -558,9 +558,9 @@ function pagbankLegacyRequest(path, queryParams = {}) {
       headers: { 'Accept': 'application/xml;charset=ISO-8859-1' },
     };
     const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', (chunk) => (data += chunk));
-      res.on('end', () => resolve({ _body: data, _status: res.statusCode }));
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => resolve({ _body: Buffer.concat(chunks).toString('latin1'), _status: res.statusCode }));
     });
     req.on('error', reject);
     req.end();
@@ -597,17 +597,17 @@ const linkNomeCache = {};
 
 // Busca o nome real do link de pagamento PagSeguro pelo código de referência
 // Endpoint: GET /v2/payment-requests/{code}
-async function fetchLinkNome(referencia) {
+async function fetchLinkNome(referencia, txCode) {
   if (!referencia || linkNomeCache[referencia] !== undefined) {
     return linkNomeCache[referencia] || null;
   }
+  if (!txCode) { linkNomeCache[referencia] = null; return null; }
   try {
-    // Referencia vem como 'LINK_PAGAE=CODIGO' — extrai so o codigo apos '='
-    const codigo = referencia.includes('=') ? referencia.split('=').pop() : referencia;
-    const result = await pagbankLegacyRequest('/v2/payment-requests/' + codigo);
-    console.log('[fetchLinkNome] codigo:', codigo, 'status:', result._status, 'body:', result._body.substring(0, 300));
-    if (result._status === 200 && result._body.includes('<paymentRequest>')) {
-      const nome = xmlVal(result._body, 'name') || xmlVal(result._body, 'shortName') || xmlVal(result._body, 'description') || null;
+    const result = await pagbankLegacyRequest('/v3/transactions/' + txCode);
+    console.log('[fetchLinkNome] ref:', referencia, 'status:', result._status, 'body:', result._body.substring(0, 300));
+    if (result._status === 200 && result._body.includes('<transaction>')) {
+      const itemMatch = result._body.match(/<item[^>]*>([\s\S]*?)<\/item>/);
+      const nome = itemMatch ? xmlVal(itemMatch[1], 'description') || null : null;
       linkNomeCache[referencia] = nome;
       return nome;
     }
@@ -750,8 +750,8 @@ app.get('/api/pagbank/transacoes', async (req, res) => {
     txs.sort((a, b) => new Date(b.data) - new Date(a.data));
 
     // Enriquecer com nome real do link (busca em paralelo, com cache)
-    const refs = [...new Set(txs.map(t => t.referencia).filter(Boolean))];
-    await Promise.all(refs.map(r => fetchLinkNome(r)));
+    const refToTxCode1 = {}; txs.forEach(tx => { if (tx.referencia && !refToTxCode1[tx.referencia]) refToTxCode1[tx.referencia] = tx.id; });
+    await Promise.all(Object.entries(refToTxCode1).map(([ref, code]) => fetchLinkNome(ref, code)));
 
     const enriquecidas = txs.map(tx => ({
       ...tx,
@@ -855,8 +855,8 @@ app.get('/api/pagamentos', async (req, res) => {
     });
 
     // Enriquecer PagBank com nome real do link (cache compartilhado)
-    const refs = [...new Set(txsPagbank.map(t => t.referencia).filter(Boolean))];
-    await Promise.all(refs.map(r => fetchLinkNome(r)));
+    const refToTxCode2 = {}; txsPagbank.forEach(tx => { if (tx.referencia && !refToTxCode2[tx.referencia]) refToTxCode2[tx.referencia] = tx.id; });
+    await Promise.all(Object.entries(refToTxCode2).map(([ref, code]) => fetchLinkNome(ref, code)));
 
     const pagbank = txsPagbank.map(tx => {
       const nomeLink = linkNomeCache[tx.referencia] || tx.link_pagamento;
