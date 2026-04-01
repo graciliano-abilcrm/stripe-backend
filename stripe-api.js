@@ -547,6 +547,20 @@ function xmlAll(xml, tag) {
   return results;
 }
 
+
+// Classifica o tipo de transação PagBank com base na descrição e valor
+function classifyTipo(descricao, valor, metodo) {
+  if (metodo === 'recorrente') return 'assinatura';
+  const desc = (descricao || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  if (desc.includes('implementa')) {
+    if (desc.includes('avancada') || valor > 5000) return 'implementacao_avancada';
+    if (desc.includes('personalizada') || (valor >= 2500 && valor <= 5000)) return 'implementacao_personalizada';
+    if (desc.includes('basica') || valor < 2500) return 'implementacao_basica';
+    return 'implementacao';
+  }
+  return 'variavel';
+}
+
 function pagbankLegacyRequest(path, queryParams = {}) {
   return new Promise((resolve, reject) => {
     const params = { email: PAGBANK_EMAIL, token: PAGBANK_TOKEN, ...queryParams };
@@ -756,6 +770,8 @@ app.get('/api/pagbank/transacoes', async (req, res) => {
     const enriquecidas = txs.map(tx => ({
       ...tx,
       link_pagamento: linkNomeCache[tx.referencia] || tx.link_pagamento,
+      descricao: linkNomeCache[tx.referencia] || tx.link_pagamento || null,
+      tipo: classifyTipo(linkNomeCache[tx.referencia] || tx.link_pagamento, tx.bruto, tx.metodo),
     }));
 
     res.json({ transacoes: enriquecidas, total: enriquecidas.length });
@@ -868,7 +884,7 @@ app.get('/api/pagamentos', async (req, res) => {
         email: tx.email || 'N/A',
         descricao: nomeLink || tx.referencia || '',
         subconta: nomeLink || '',
-        tipo: tx.metodo === 'recorrente' ? 'assinatura' : 'variavel',
+        tipo: classifyTipo(nomeLink, tx.bruto, tx.metodo),
         metodo: tx.metodo,
         link_pagamento: nomeLink,
         referencia: tx.referencia,
