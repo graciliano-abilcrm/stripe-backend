@@ -957,53 +957,79 @@ app.get('/api/pagbank/repasses/projecao', async (req, res) => {
 // GET /api/pagamentos — pagamentos unificados Stripe + PagBank
 app.get('/api/pagamentos', async (req, res) => {
   try {
-    const { inicio, fim, inicioDate, fimDate } = getPeriodo(req);
+    const { inicio, fim } = getPeriodo(req);
     const { inicio: inicioPB, fim: fimPB } = getPeriodoPagbank(req);
 
     const [charges, txsPagbank] = await Promise.all([
-      stripeListAll('charges', { 'created[gte]': String(inicio), 'created[lte]': String(fim) }),
+      stripeListAll('charges', {
+        'created[gte]': String(inicio), 'created[lte]': String(fim),
+        'expand[]': 'data.balance_transaction',
+      }),
       pagbankListAllTx(inicioPB, fimPB),
     ]);
 
     const stripe = charges.map(c => {
       const match = c.description?.match(/Auto-Recharge for Sub-Account - (.+?) (?:of BRL|\d)/);
+      const valor = (c.amount || 0) / 100;
+      const bt = c.balance_transaction && typeof c.balance_transaction === 'object' ? c.balance_transaction : null;
+      const valor_liquido = bt ? parseFloat(((bt.net || 0) / 100).toFixed(2)) : null;
+      const taxa = bt ? parseFloat(((bt.fee || 0) / 100).toFixed(2)) : null;
+      const pm = c.payment_method_details;
+      const metodo = pm?.type === 'card' ? 'cartao' : (pm?.type || 'cartao');
+      const parcelas = pm?.card?.installments?.plan?.count || 1;
+      const dataStr = new Date(c.created * 1000).toISOString().substring(0, 10);
+      const statusStr = c.status === 'succeeded' ? 'aprovado' : c.status === 'failed' ? 'falhou' : c.status;
       return {
         id: c.id,
         plataforma: 'stripe',
-        valor: (c.amount || 0) / 100,
-        status: c.status === 'succeeded' ? 'aprovado' : c.status === 'failed' ? 'falhou' : c.status,
-        email: c.billing_details?.email || 'N/A',
+        valor,
+        valor_liquido,
+        taxa,
+        nome: c.billing_details?.name || null,
+        email: c.billing_details?.email || null,
+        telefone: c.billing_details?.phone || null,
+        status: statusStr,
         descricao: c.description || '',
         subconta: match ? match[1].trim() : '',
-        tipo: c.invoice ? 'assinatura' : 'variavel',
-        metodo: c.payment_method_details?.type || 'cartao',
+        tipo: classifyTipo(c.description, valor, c.invoice ? 'recorrente' : metodo, 'stripe'),
+        metodo,
+        parcelas,
         link_pagamento: null,
         referencia: null,
         data: new Date(c.created * 1000).toLocaleDateString('pt-BR'),
         data_sort: c.created,
+        previsao_recebimento: calcPrevisaoRecebimento(dataStr, metodo, parcelas, statusStr, 'stripe'),
       };
     });
 
     // Enriquecer PagBank com nome real do link (cache compartilhado)
     const refToTxCode2 = {}; txsPagbank.forEach(tx => { if (tx.referencia && !refToTxCode2[tx.referencia]) refToTxCode2[tx.referencia] = tx.id; });
-    await Promise.all(Object.entries(refToTxCode2).map(([ref, code]) => fetchLinkNome(ref, code)));
+    await Promise.all(Object.entries(refToTxCode2).map(([ref, code2]) => fetchLinkNome(ref, code2)));
 
     const pagbank = txsPagbank.map(tx => {
       const nomeLink = linkNomeCache[tx.referencia] || tx.link_pagamento;
+      const parcelas = parcelasCache[tx.id] || tx.parcelas;
+      const statusStr = tx.status === 'disponivel' || tx.status === 'pago' ? 'aprovado' : tx.status === 'cancelado' || tx.status === 'devolvido' ? 'falhou' : tx.status;
       return {
         id: tx.id,
         plataforma: 'pagbank',
         valor: tx.bruto,
-        status: tx.status === 'disponivel' || tx.status === 'pago' ? 'aprovado' : tx.status === 'cancelado' || tx.status === 'devolvido' ? 'falhou' : tx.status,
-        email: tx.email || 'N/A',
+        valor_liquido: tx.liquido,
+        taxa: tx.taxa,
+        nome: tx.nome && tx.nome !== 'N/A' ? tx.nome : null,
+        email: tx.email && tx.email !== 'N/A' ? tx.email : null,
+        telefone: tx.telefone || null,
+        status: statusStr,
         descricao: nomeLink || tx.referencia || '',
         subconta: nomeLink || '',
         tipo: classifyTipo(nomeLink, tx.bruto, tx.metodo, 'pagbank'),
         metodo: tx.metodo,
+        parcelas,
         link_pagamento: nomeLink,
         referencia: tx.referencia,
         data: tx.data,
-        data_sort: new Date(tx.data).getTime() / 1000,
+        data_sort: new Date(tx.data + 'T12:00:00Z').getTime() / 1000,
+        previsao_recebimento: calcPrevisaoRecebimento(tx.data, tx.metodo, parcelas, statusStr, 'pagbank'),
       };
     });
 
