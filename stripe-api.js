@@ -725,15 +725,20 @@ function calcPrevisaoRecebimento(dataStr, metodo, parcelas, status, plataforma) 
   const txDate = new Date(dataStr + 'T03:00:00Z');
   let targetDate;
   if (plataforma === 'stripe') {
+    // Stripe Brazil: D+2 dias uteis
     targetDate = addBizDays(txDate, 2);
   } else if (metodo === 'pix') {
-    targetDate = addBizDays(txDate, 1);
+    // PagBank PIX Link: D+1 dia corrido
+    targetDate = new Date(txDate.getTime() + 1 * 24 * 60 * 60 * 1000);
   } else if (metodo === 'boleto') {
-    targetDate = addBizDays(txDate, 3);
+    // PagBank Boleto Link: D+1 dia util
+    targetDate = addBizDays(txDate, 1);
   } else if (metodo === 'debito') {
-    targetDate = addBizDays(txDate, 2);
+    // PagBank Debito online: D+1 dia util
+    targetDate = addBizDays(txDate, 1);
   } else {
-    targetDate = new Date(txDate.getTime() + 30 * 24 * 60 * 60 * 1000);
+    // PagBank Cartao credito Link de Pagamento: D+14 dias corridos
+    targetDate = new Date(txDate.getTime() + 14 * 24 * 60 * 60 * 1000);
   }
   const now = new Date();
   const brtNow = new Date(now.getTime() - 3 * 60 * 60 * 1000);
