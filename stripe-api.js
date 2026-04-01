@@ -602,7 +602,10 @@ async function fetchLinkNome(referencia) {
     return linkNomeCache[referencia] || null;
   }
   try {
-    const result = await // Referencia vem como 'LINK_PAGAE=CODIGO' — extrai so o codigo apos '='    const codigo = referencia.includes('=') ? referencia.split('=').pop() : referencia;
+    // Referencia vem como 'LINK_PAGAE=CODIGO' — extrai so o codigo apos '='
+    const codigo = referencia.includes('=') ? referencia.split('=').pop() : referencia;
+    const result = await pagbankLegacyRequest('/v2/payment-requests/' + codigo);
+    console.log('[fetchLinkNome] codigo:', codigo, 'status:', result._status, 'body:', result._body.substring(0, 300));
     if (result._status === 200 && result._body.includes('<paymentRequest>')) {
       const nome = xmlVal(result._body, 'name') || xmlVal(result._body, 'shortName') || xmlVal(result._body, 'description') || null;
       linkNomeCache[referencia] = nome;
