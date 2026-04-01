@@ -8,7 +8,7 @@ const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
 app.use(cors());
 app.use(express.json());
 
-function stripeRequest(path) 
+function stripeRequest(path){
   return new Promise((resolve, reject) => {
     const options = {
       hostname: 'api.stripe.com',
