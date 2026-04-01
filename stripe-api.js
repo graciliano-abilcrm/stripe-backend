@@ -2,14 +2,13 @@ const express = require('express');
 const cors = require('cors');
 const https = require('https');
 
-const app = express();
-const PORT = process.env.PORT || 3001;
+const app = express();const PORT = process.env.PORT || 3001;
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
 
 app.use(cors());
 app.use(express.json());
 
-function stripeRequest(path) {
+function stripeRequest(path) 
   return new Promise((resolve, reject) => {
     const options = {
       hostname: 'api.stripe.com',
@@ -603,9 +602,9 @@ async function fetchLinkNome(referencia) {
     return linkNomeCache[referencia] || null;
   }
   try {
-    const result = await pagbankLegacyRequest('/v2/payment-requests/' + referencia);
+    const result = await // Referencia vem como 'LINK_PAGAE=CODIGO' — extrai so o codigo apos '='    const codigo = referencia.includes('=') ? referencia.split('=').pop() : referencia;
     if (result._status === 200 && result._body.includes('<paymentRequest>')) {
-      const nome = xmlVal(result._body, 'name') || xmlVal(result._body, 'shortName') || null;
+      const nome = xmlVal(result._body, 'name') || xmlVal(result._body, 'shortName') || xmlVal(result._body, 'description') || null;
       linkNomeCache[referencia] = nome;
       return nome;
     }
