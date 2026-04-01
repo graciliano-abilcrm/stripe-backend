@@ -253,21 +253,36 @@ app.get('/api/stripe/pagamentos', async (req, res) => {
     const charges = await stripeListAll('charges', {
       'created[gte]': String(inicio),
       'created[lte]': String(fim),
+      'expand[]': 'data.balance_transaction',
     });
     const pagamentos = charges.map(c => {
       const match = c.description?.match(/Auto-Recharge for Sub-Account - (.+?) (?:of BRL|\d)/);
       const subconta = match ? match[1].trim() : '';
+      const valor = (c.amount || 0) / 100;
+      const bt = c.balance_transaction && typeof c.balance_transaction === 'object' ? c.balance_transaction : null;
+      const valor_liquido = bt ? parseFloat(((bt.net || 0) / 100).toFixed(2)) : null;
+      const taxa = bt ? parseFloat(((bt.fee || 0) / 100).toFixed(2)) : null;
+      const pm = c.payment_method_details;
+      const metodo = pm?.type === 'card' ? 'cartao' : (pm?.type || 'outro');
+      const parcelas = pm?.card?.installments?.plan?.count || 1;
+      const dataStr = new Date(c.created * 1000).toISOString().substring(0, 10);
       return {
         id: c.id,
-        valor: (c.amount || 0) / 100,
+        valor,
+        valor_liquido,
+        taxa,
         status: c.status,
+        nome: c.billing_details?.name || 'N/A',
         email: c.billing_details?.email || 'N/A',
+        telefone: c.billing_details?.phone || null,
+        metodo,
+        parcelas,
         descricao: c.description || '',
         subconta,
-        tipo: c.invoice ? 'assinatura' : 'variavel',
+        tipo: classifyTipo(c.description, valor, c.invoice ? 'recorrente' : metodo, 'stripe'),
         data: new Date(c.created * 1000).toLocaleDateString('pt-BR'),
-        capturado: c.captured,
         plataforma: 'stripe',
+        previsao_recebimento: calcPrevisaoRecebimento(dataStr, metodo, parcelas, c.status, 'stripe'),
       };
     });
     res.json({ pagamentos, total: pagamentos.length });
@@ -660,6 +675,9 @@ function parseTx(txXml) {
   const statusMap = { '1': 'aguardando', '2': 'em_analise', '3': 'pago', '4': 'disponivel', '5': 'em_disputa', '6': 'devolvido', '7': 'cancelado', '8': 'chargeback', '9': 'retencao' };
   const senderMatch = txXml.match(/<sender[^>]*>([\s\S]*?)<\/sender>/);
   const itemMatch = txXml.match(/<item[^>]*>([\s\S]*?)<\/item>/);
+  const phoneMatch = senderMatch ? senderMatch[1].match(/<phone[^>]*>([\s\S]*?)<\/phone>/) : null;
+  const areaCode = phoneMatch ? xmlVal(phoneMatch[1], 'areaCode') : '';
+  const phoneNum = phoneMatch ? xmlVal(phoneMatch[1], 'number') : '';
   return {
     id: xmlVal(txXml, 'code'),
     bruto: parseFloat(xmlVal(txXml, 'grossAmount') || '0'),
@@ -670,10 +688,47 @@ function parseTx(txXml) {
     parcelas: parseInt(xmlVal(txXml, 'installmentCount') || '1'),
     nome: senderMatch ? xmlVal(senderMatch[1], 'name') : 'N/A',
     email: senderMatch ? xmlVal(senderMatch[1], 'email') : 'N/A',
+    telefone: areaCode && phoneNum ? `(${areaCode}) ${phoneNum}` : null,
     data: xmlVal(txXml, 'date').substring(0, 10),
     referencia: xmlVal(txXml, 'reference') || null,
     link_pagamento: itemMatch ? xmlVal(itemMatch[1], 'description') || null : null,
     plataforma: 'pagbank',
+  };
+}
+
+function calcPrevisaoRecebimento(dataStr, metodo, parcelas, status, plataforma) {
+  if (!dataStr || ['cancelado', 'devolvido', 'chargeback'].includes(status)) return null;
+  const addBizDays = (date, days) => {
+    const r = new Date(date.getTime());
+    let added = 0;
+    while (added < days) {
+      r.setUTCDate(r.getUTCDate() + 1);
+      const d = r.getUTCDay();
+      if (d !== 0 && d !== 6) added++;
+    }
+    return r;
+  };
+  const txDate = new Date(dataStr + 'T03:00:00Z');
+  let targetDate;
+  if (plataforma === 'stripe') {
+    targetDate = addBizDays(txDate, 2);
+  } else if (metodo === 'pix') {
+    targetDate = addBizDays(txDate, 1);
+  } else if (metodo === 'boleto') {
+    targetDate = addBizDays(txDate, 3);
+  } else if (metodo === 'debito') {
+    targetDate = addBizDays(txDate, 2);
+  } else {
+    targetDate = new Date(txDate.getTime() + 30 * 24 * 60 * 60 * 1000);
+  }
+  const now = new Date();
+  const brtNow = new Date(now.getTime() - 3 * 60 * 60 * 1000);
+  const todayMs = Date.UTC(brtNow.getUTCFullYear(), brtNow.getUTCMonth(), brtNow.getUTCDate());
+  const diffDays = Math.ceil((targetDate.getTime() - todayMs) / 86400000);
+  return {
+    data_prevista: targetDate.toISOString().substring(0, 10),
+    dias_restantes: Math.max(0, diffDays),
+    ja_disponivel: diffDays <= 0,
   };
 }
 
@@ -802,13 +857,17 @@ app.get('/api/pagbank/transacoes', async (req, res) => {
     const refToTxCode1 = {}; txs.forEach(tx => { if (tx.referencia && !refToTxCode1[tx.referencia]) refToTxCode1[tx.referencia] = tx.id; });
     await Promise.all(Object.entries(refToTxCode1).map(([ref, code]) => fetchLinkNome(ref, code)));
 
-    const enriquecidas = txs.map(tx => ({
-      ...tx,
-      link_pagamento: linkNomeCache[tx.referencia] || tx.link_pagamento,
-      descricao: linkNomeCache[tx.referencia] || tx.link_pagamento || null,
-      tipo: classifyTipo(linkNomeCache[tx.referencia] || tx.link_pagamento, tx.bruto, tx.metodo, 'pagbank'),
-      parcelas: parcelasCache[tx.id] || tx.parcelas,
-    }));
+    const enriquecidas = txs.map(tx => {
+      const parcelas = parcelasCache[tx.id] || tx.parcelas;
+      return {
+        ...tx,
+        link_pagamento: linkNomeCache[tx.referencia] || tx.link_pagamento,
+        descricao: linkNomeCache[tx.referencia] || tx.link_pagamento || null,
+        tipo: classifyTipo(linkNomeCache[tx.referencia] || tx.link_pagamento, tx.bruto, tx.metodo, 'pagbank'),
+        parcelas,
+        previsao_recebimento: calcPrevisaoRecebimento(tx.data, tx.metodo, parcelas, tx.status, 'pagbank'),
+      };
+    });
 
     res.json({ transacoes: enriquecidas, total: enriquecidas.length });
   } catch (err) { res.status(500).json({ error: err.message }); }
