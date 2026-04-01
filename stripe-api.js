@@ -645,6 +645,7 @@ function getPeriodoPagbank(req) {
 // Cache em memória: referencia -> nome do link (evita chamadas repetidas)
 const linkNomeCache = {};
 const parcelasCache = {};
+const senderCache = {}; // txCode -> { nome, email, telefone }
 
 // Busca o nome real do link de pagamento PagSeguro pelo código de referência
 // Endpoint: GET /v2/payment-requests/{code}
@@ -660,7 +661,20 @@ async function fetchLinkNome(referencia, txCode) {
       const itemMatch = result._body.match(/<item[^>]*>([\s\S]*?)<\/item>/);
       const nome = itemMatch ? xmlVal(itemMatch[1], 'description') || null : null;
       linkNomeCache[referencia] = nome;
-      if (txCode) parcelasCache[txCode] = parseInt(xmlVal(result._body, 'installmentCount') || '0') || null;
+      if (txCode) {
+        parcelasCache[txCode] = parseInt(xmlVal(result._body, 'installmentCount') || '0') || null;
+        const senderXml = result._body.match(/<sender[^>]*>([\s\S]*?)<\/sender>/);
+        if (senderXml) {
+          const phoneXml = senderXml[1].match(/<phone[^>]*>([\s\S]*?)<\/phone>/);
+          const ac = phoneXml ? xmlVal(phoneXml[1], 'areaCode') : '';
+          const pn = phoneXml ? xmlVal(phoneXml[1], 'number') : '';
+          senderCache[txCode] = {
+            nome: xmlVal(senderXml[1], 'name') || null,
+            email: xmlVal(senderXml[1], 'email') || null,
+            telefone: ac && pn ? `(${ac}) ${pn}` : null,
+          };
+        }
+      }
       return nome;
     }
   } catch (e) { console.error('[fetchLinkNome] erro:', e.message); }
@@ -859,12 +873,17 @@ app.get('/api/pagbank/transacoes', async (req, res) => {
 
     const enriquecidas = txs.map(tx => {
       const parcelas = parcelasCache[tx.id] || tx.parcelas;
+      const sender = senderCache[tx.id] || {};
       return {
         ...tx,
+        nome: (sender.nome && sender.nome !== 'N/A') ? sender.nome : (tx.nome !== 'N/A' ? tx.nome : null),
+        email: (sender.email && sender.email !== 'N/A') ? sender.email : (tx.email !== 'N/A' ? tx.email : null),
+        telefone: sender.telefone || tx.telefone || null,
         link_pagamento: linkNomeCache[tx.referencia] || tx.link_pagamento,
         descricao: linkNomeCache[tx.referencia] || tx.link_pagamento || null,
         tipo: classifyTipo(linkNomeCache[tx.referencia] || tx.link_pagamento, tx.bruto, tx.metodo, 'pagbank'),
         parcelas,
+        valor_liquido: tx.liquido, // alias para consistencia com Stripe
         previsao_recebimento: calcPrevisaoRecebimento(tx.data, tx.metodo, parcelas, tx.status, 'pagbank'),
       };
     });
