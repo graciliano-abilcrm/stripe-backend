@@ -549,7 +549,7 @@ function xmlAll(xml, tag) {
 
 
 // Classifica o tipo de transação PagBank com base na descrição e valor
-function classifyTipo(descricao, valor, metodo) {
+function classifyTipo(descricao, valor, metodo, plataforma) {
   if (metodo === 'recorrente') return 'assinatura';
   const desc = (descricao || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
   if (desc.includes('implementa')) {
@@ -557,6 +557,12 @@ function classifyTipo(descricao, valor, metodo) {
     if (desc.includes('personalizada') || (valor >= 2500 && valor <= 5000)) return 'implementacao_personalizada';
     if (desc.includes('basica') || valor < 2500) return 'implementacao_basica';
     return 'implementacao';
+  }
+  // PagBank: todos sao implementacoes — classificar por valor
+  if (plataforma === 'pagbank') {
+    if (valor > 5000) return 'implementacao_avancada';
+    if (valor >= 2500) return 'implementacao_personalizada';
+    return 'implementacao_basica';
   }
   return 'variavel';
 }
@@ -655,22 +661,33 @@ function parseTx(txXml) {
 }
 
 async function pagbankListAllTx(initialDate, finalDate) {
+  // PagBank Legacy API max range: 30 dias. Divide em chunks para periodos maiores.
+  const toPS = (d) => { const pad = (n) => String(n).padStart(2, '0'); return d.getFullYear() + '-' + pad(d.getMonth()+1) + '-' + pad(d.getDate()) + 'T' + pad(d.getHours()) + ':' + pad(d.getMinutes()); };
+  const startD = new Date(initialDate + ':00');
+  const endD   = new Date(finalDate   + ':00');
+  const MAX_MS  = 29 * 24 * 60 * 60 * 1000; // 29 dias para margem de seguranca
   let all = [];
-  let page = 1;
-  let totalPages = 1;
-  while (page <= totalPages) {
-    const result = await pagbankLegacyRequest('/v3/transactions', {
-      initialDate, finalDate, maxPageResults: 100, page,
-    });
-    const xml = result._body;
-    if (!xml.includes('<transactionSearchResult>')) {
-      throw new Error('PagBank API error (' + result._status + '): ' + xml.substring(0, 300));
+  let chunkStart = new Date(startD);
+  while (chunkStart < endD) {
+    const chunkEnd = new Date(Math.min(chunkStart.getTime() + MAX_MS, endD.getTime()));
+    let page = 1;
+    let totalPages = 1;
+    while (page <= totalPages) {
+      const result = await pagbankLegacyRequest('/v3/transactions', {
+        initialDate: toPS(chunkStart), finalDate: toPS(chunkEnd), maxPageResults: 100, page,
+      });
+      const xml = result._body;
+      if (!xml.includes('<transactionSearchResult>')) {
+        console.error('[pagbankListAllTx] API error (' + result._status + '):', xml.substring(0, 200));
+        break;
+      }
+      const txXmls = xmlAll(xml, 'transaction');
+      all = all.concat(txXmls.map(parseTx));
+      const tp = parseInt(xmlVal(xml, 'totalPages') || '1');
+      totalPages = tp > 0 ? tp : 1;
+      page++;
     }
-    const txXmls = xmlAll(xml, 'transaction');
-    all = all.concat(txXmls.map(parseTx));
-    const tp = parseInt(xmlVal(xml, 'totalPages') || '1');
-    totalPages = tp > 0 ? tp : 1;
-    page++;
+    chunkStart = new Date(chunkEnd.getTime() + 60 * 1000);
   }
   return all;
 }
@@ -771,7 +788,7 @@ app.get('/api/pagbank/transacoes', async (req, res) => {
       ...tx,
       link_pagamento: linkNomeCache[tx.referencia] || tx.link_pagamento,
       descricao: linkNomeCache[tx.referencia] || tx.link_pagamento || null,
-      tipo: classifyTipo(linkNomeCache[tx.referencia] || tx.link_pagamento, tx.bruto, tx.metodo),
+      tipo: classifyTipo(linkNomeCache[tx.referencia] || tx.link_pagamento, tx.bruto, tx.metodo, 'pagbank'),
     }));
 
     res.json({ transacoes: enriquecidas, total: enriquecidas.length });
@@ -884,7 +901,7 @@ app.get('/api/pagamentos', async (req, res) => {
         email: tx.email || 'N/A',
         descricao: nomeLink || tx.referencia || '',
         subconta: nomeLink || '',
-        tipo: classifyTipo(nomeLink, tx.bruto, tx.metodo),
+        tipo: classifyTipo(nomeLink, tx.bruto, tx.metodo, 'pagbank'),
         metodo: tx.metodo,
         link_pagamento: nomeLink,
         referencia: tx.referencia,
