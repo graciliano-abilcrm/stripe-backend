@@ -1305,7 +1305,7 @@ app.delete('/api/ghl/mapeamentos/:stripe_customer_id', (req, res) => {
 app.get('/api/debug/link', async (req, res) => {
   const code = req.query.code || '81DTTkpzq';
   try {
-    const result = await pagbankLegacyRequest('/v2/payment-requests/' + code);
+    const result = await pagbankLegacyRequest('/v3/transactions/' + code);
     res.json({ code, status: result._status, body: result._body.substring(0, 1000) });
   } catch (e) {
     res.json({ code, error: e.message });
