@@ -1685,8 +1685,9 @@ app.get('/api/dashboard/resumo', async (req, res) => {
     const round = v => parseFloat((v || 0).toFixed(2));
 
     let s_bruto = 0, s_liquido = 0, s_taxas = 0, s_falhas = 0, s_a_receber = 0;
-    let mrr = 0;
+    let mrr = 0, s_novas = 0, s_cancelamentos = 0;
     const mrr_cat = { variavel: 0, basico: 0, scale: 0, avancado: 0 };
+    const sub_count = { variavel: 0, basico: 0, scale: 0, avancado: 0 };
     let p_bruto = 0, p_liquido = 0, p_taxas = 0, p_falhas = 0, p_a_receber = 0;
     const pipeline = { cartao: 0, pix: 0, boleto: 0, debito: 0 };
 
@@ -1713,8 +1714,6 @@ app.get('/api/dashboard/resumo', async (req, res) => {
       s_a_receber = ((stripeBalance.pending || []).reduce((s, b) => s + b.amount, 0)) / 100;
 
       // MRR: mesma logica do /api/stripe/mrr — normaliza anual/semanal para mensal
-      // Conta assinaturas ativas por categoria
-      const sub_count = { variavel: 0, basico: 0, scale: 0, avancado: 0 };
       for (const sub of (activeSubs || [])) {
         for (const item of (sub.items?.data || [])) {
           const price = item.price;
@@ -1738,8 +1737,8 @@ app.get('/api/dashboard/resumo', async (req, res) => {
         stripeListAll('subscriptions', { status: 'all', 'created[gte]': String(inicio), 'created[lte]': String(fim) }),
         stripeListAll('subscriptions', { status: 'canceled', 'created[gte]': String(inicio - 180 * 86400) }),
       ]);
-      const s_novas = newSubs.length;
-      const s_cancelamentos = canceledSubs.filter(s => s.ended_at && s.ended_at >= inicio && s.ended_at <= fim).length;
+      s_novas = newSubs.length;
+      s_cancelamentos = canceledSubs.filter(s => s.ended_at && s.ended_at >= inicio && s.ended_at <= fim).length;
     }
 
     // impl_tipos definido aqui para estar no scope do res.json
