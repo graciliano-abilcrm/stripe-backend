@@ -1055,7 +1055,13 @@ app.get('/api/projecao/recebimento', async (req, res) => {
     const { inicio, fim } = getPeriodo(fakeReq);
     const { inicio: inicioPB, fim: fimPB } = getPeriodoPagbank(fakeReq);
 
-    const [charges, txsPagbank] = await Promise.all([
+    // Data de hoje em BRT (UTC-3) para filtrar somente datas futuras no grafico
+    const brtNow = new Date(agora.getTime() - 3 * 60 * 60 * 1000);
+    const todayStr = brtNow.toISOString().substring(0, 10); // YYYY-MM-DD
+
+    const [stripeBalance, charges, txsPagbank] = await Promise.all([
+      // Balance API = fonte da verdade para stripe_pendente (total real a receber)
+      stripeRequest('/v1/balance'),
       stripeListAll('charges', {
         'created[gte]': String(inicio), 'created[lte]': String(fim),
         'expand[]': 'data.balance_transaction',
@@ -1063,43 +1069,46 @@ app.get('/api/projecao/recebimento', async (req, res) => {
       pagbankListAllTx(inicioPB, fimPB),
     ]);
 
+    // stripe_pendente = saldo pending oficial da Stripe (bate com card "A liberar")
+    const stripe_pendente = parseFloat(
+      ((stripeBalance.pending || []).reduce((s, b) => s + b.amount, 0) / 100).toFixed(2)
+    );
+
     // Enriquecer PagBank com senderCache e parcelasCache
     const refMap = {}; txsPagbank.forEach(tx => { if (tx.referencia && !refMap[tx.referencia]) refMap[tx.referencia] = tx.id; });
     await Promise.all(Object.entries(refMap).map(([ref, code2]) => fetchLinkNome(ref, code2)));
 
-    // Acumular por data_prevista
+    // Acumular por data_prevista (somente datas futuras — hoje exclusive)
     const byDate = {};
     const addEntry = (date, stripe, pagbank) => {
+      if (date <= todayStr) return; // ignorar datas de hoje ou passadas no grafico
       if (!byDate[date]) byDate[date] = { data: date, stripe: 0, pagbank: 0, total: 0 };
       byDate[date].stripe = parseFloat((byDate[date].stripe + stripe).toFixed(2));
       byDate[date].pagbank = parseFloat((byDate[date].pagbank + pagbank).toFixed(2));
       byDate[date].total = parseFloat((byDate[date].stripe + byDate[date].pagbank).toFixed(2));
     };
 
-    // Stripe — usa balance_transaction.status e available_on para data exata de liquidacao
-    // bt.status 'pending' = ainda nao liquidado; 'available' = ja na conta, ignorar
+    // Stripe — bt.available_on como data exata; bt.status='pending' = nao liquidado ainda
     charges.forEach(c => {
       if (c.status !== 'succeeded') return;
       const bt = c.balance_transaction && typeof c.balance_transaction === 'object' ? c.balance_transaction : null;
-      if (!bt) return;
-      if (bt.status !== 'pending') return; // 'available' = ja liquidado, pular
+      if (!bt || bt.status !== 'pending') return;
       const liquido = (bt.net || 0) / 100;
-      // available_on = timestamp Unix da data exata em que o Stripe libera os fundos (fonte da verdade)
       const availableOn = new Date(bt.available_on * 1000).toISOString().substring(0, 10);
       addEntry(availableOn, liquido, 0);
     });
 
-    // PagBank — usa status real da transacao como fonte da verdade
-    // 'pago' (status 3) = aprovado pelo cliente mas ainda nao creditado ao vendedor
-    // 'disponivel' (status 4) = ja creditado na conta PagBank, NAO incluir na projecao
+    // PagBank — status 'pago' = aprovado mas ainda nao creditado ao vendedor
+    let pagbank_pendente_calc = 0;
     txsPagbank.forEach(tx => {
-      if (tx.status !== 'pago') return; // somente pendente de credito ao vendedor
+      if (tx.status !== 'pago') return;
       const parcelas = parcelasCache[tx.id] || tx.parcelas;
       const prev = calcPrevisaoRecebimento(tx.data, tx.metodo, parcelas, 'aprovado', 'pagbank');
-      if (prev) {
-        addEntry(prev.data_prevista, 0, tx.liquido || tx.bruto);
-      }
+      const valor = tx.liquido || tx.bruto;
+      pagbank_pendente_calc += valor;
+      if (prev) addEntry(prev.data_prevista, 0, valor);
     });
+    const pagbank_pendente = parseFloat(pagbank_pendente_calc.toFixed(2));
 
     // Ordenar por data e formatar para o frontend
     const projecao = Object.values(byDate)
@@ -1109,12 +1118,13 @@ app.get('/api/projecao/recebimento', async (req, res) => {
         data_br: d.data.split('-').reverse().join('/'), // DD/MM/YYYY
       }));
 
-    const total_pendente = projecao.reduce((s, d) => s + d.total, 0);
     res.json({
       projecao,
-      total_pendente: parseFloat(total_pendente.toFixed(2)),
-      stripe_pendente: parseFloat(projecao.reduce((s, d) => s + d.stripe, 0).toFixed(2)),
-      pagbank_pendente: parseFloat(projecao.reduce((s, d) => s + d.pagbank, 0).toFixed(2)),
+      // Totais usam fontes oficiais (Balance API Stripe + status PagBank)
+      // garantindo coerencia com os cards de "A liberar" em toda plataforma
+      stripe_pendente,
+      pagbank_pendente,
+      total_pendente: parseFloat((stripe_pendente + pagbank_pendente).toFixed(2)),
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
