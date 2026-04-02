@@ -1043,6 +1043,84 @@ app.get('/api/pagamentos', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// GET /api/projecao/recebimento — projecao unificada Stripe+PagBank por data de recebimento
+app.get('/api/projecao/recebimento', async (req, res) => {
+  try {
+    // Busca os ultimos 90 dias para capturar todos os pagamentos pendentes de liquidacao
+    const agora = new Date();
+    const inicioUnix = Math.floor((agora.getTime() - 90 * 24 * 60 * 60 * 1000) / 1000);
+    const fimUnix = Math.floor(agora.getTime() / 1000);
+    const fakeReq = { query: { start: String(inicioUnix), end: String(fimUnix) } };
+
+    const { inicio, fim } = getPeriodo(fakeReq);
+    const { inicio: inicioPB, fim: fimPB } = getPeriodoPagbank(fakeReq);
+
+    const [charges, txsPagbank] = await Promise.all([
+      stripeListAll('charges', {
+        'created[gte]': String(inicio), 'created[lte]': String(fim),
+        'expand[]': 'data.balance_transaction',
+      }),
+      pagbankListAllTx(inicioPB, fimPB),
+    ]);
+
+    // Enriquecer PagBank com senderCache e parcelasCache
+    const refMap = {}; txsPagbank.forEach(tx => { if (tx.referencia && !refMap[tx.referencia]) refMap[tx.referencia] = tx.id; });
+    await Promise.all(Object.entries(refMap).map(([ref, code2]) => fetchLinkNome(ref, code2)));
+
+    // Acumular por data_prevista
+    const byDate = {};
+    const addEntry = (date, stripe, pagbank) => {
+      if (!byDate[date]) byDate[date] = { data: date, stripe: 0, pagbank: 0, total: 0 };
+      byDate[date].stripe = parseFloat((byDate[date].stripe + stripe).toFixed(2));
+      byDate[date].pagbank = parseFloat((byDate[date].pagbank + pagbank).toFixed(2));
+      byDate[date].total = parseFloat((byDate[date].stripe + byDate[date].pagbank).toFixed(2));
+    };
+
+    // Stripe
+    charges.forEach(c => {
+      const valor = (c.amount || 0) / 100;
+      const bt = c.balance_transaction && typeof c.balance_transaction === 'object' ? c.balance_transaction : null;
+      const liquido = bt ? (bt.net || 0) / 100 : valor;
+      const pm = c.payment_method_details;
+      const metodo = pm?.type === 'card' ? 'cartao' : (pm?.type || 'cartao');
+      const parcelas = pm?.card?.installments?.plan?.count || 1;
+      const dataStr = new Date(c.created * 1000).toISOString().substring(0, 10);
+      const statusStr = c.status === 'succeeded' ? 'aprovado' : c.status === 'failed' ? 'falhou' : c.status;
+      const prev = calcPrevisaoRecebimento(dataStr, metodo, parcelas, statusStr, 'stripe');
+      if (prev && !prev.ja_disponivel) {
+        addEntry(prev.data_prevista, liquido, 0);
+      }
+    });
+
+    // PagBank
+    txsPagbank.forEach(tx => {
+      const parcelas = parcelasCache[tx.id] || tx.parcelas;
+      const statusStr = tx.status === 'disponivel' || tx.status === 'pago' ? 'aprovado'
+        : tx.status === 'cancelado' || tx.status === 'devolvido' ? 'falhou' : tx.status;
+      const prev = calcPrevisaoRecebimento(tx.data, tx.metodo, parcelas, statusStr, 'pagbank');
+      if (prev && !prev.ja_disponivel) {
+        addEntry(prev.data_prevista, 0, tx.liquido || tx.bruto);
+      }
+    });
+
+    // Ordenar por data e formatar para o frontend
+    const projecao = Object.values(byDate)
+      .sort((a, b) => a.data.localeCompare(b.data))
+      .map(d => ({
+        ...d,
+        data_br: d.data.split('-').reverse().join('/'), // DD/MM/YYYY
+      }));
+
+    const total_pendente = projecao.reduce((s, d) => s + d.total, 0);
+    res.json({
+      projecao,
+      total_pendente: parseFloat(total_pendente.toFixed(2)),
+      stripe_pendente: parseFloat(projecao.reduce((s, d) => s + d.stripe, 0).toFixed(2)),
+      pagbank_pendente: parseFloat(projecao.reduce((s, d) => s + d.pagbank, 0).toFixed(2)),
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // GET /api/pagbank/debug — remover após testes
 app.get('/api/pagbank/debug', async (req, res) => {
   try {
