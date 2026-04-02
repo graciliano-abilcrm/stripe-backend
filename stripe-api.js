@@ -1076,29 +1076,27 @@ app.get('/api/projecao/recebimento', async (req, res) => {
       byDate[date].total = parseFloat((byDate[date].stripe + byDate[date].pagbank).toFixed(2));
     };
 
-    // Stripe
+    // Stripe — usa balance_transaction.status e available_on para data exata de liquidacao
+    // bt.status 'pending' = ainda nao liquidado; 'available' = ja na conta, ignorar
     charges.forEach(c => {
-      const valor = (c.amount || 0) / 100;
+      if (c.status !== 'succeeded') return;
       const bt = c.balance_transaction && typeof c.balance_transaction === 'object' ? c.balance_transaction : null;
-      const liquido = bt ? (bt.net || 0) / 100 : valor;
-      const pm = c.payment_method_details;
-      const metodo = pm?.type === 'card' ? 'cartao' : (pm?.type || 'cartao');
-      const parcelas = pm?.card?.installments?.plan?.count || 1;
-      const dataStr = new Date(c.created * 1000).toISOString().substring(0, 10);
-      const statusStr = c.status === 'succeeded' ? 'aprovado' : c.status === 'failed' ? 'falhou' : c.status;
-      const prev = calcPrevisaoRecebimento(dataStr, metodo, parcelas, statusStr, 'stripe');
-      if (prev && !prev.ja_disponivel) {
-        addEntry(prev.data_prevista, liquido, 0);
-      }
+      if (!bt) return;
+      if (bt.status !== 'pending') return; // 'available' = ja liquidado, pular
+      const liquido = (bt.net || 0) / 100;
+      // available_on = timestamp Unix da data exata em que o Stripe libera os fundos (fonte da verdade)
+      const availableOn = new Date(bt.available_on * 1000).toISOString().substring(0, 10);
+      addEntry(availableOn, liquido, 0);
     });
 
-    // PagBank
+    // PagBank — usa status real da transacao como fonte da verdade
+    // 'pago' (status 3) = aprovado pelo cliente mas ainda nao creditado ao vendedor
+    // 'disponivel' (status 4) = ja creditado na conta PagBank, NAO incluir na projecao
     txsPagbank.forEach(tx => {
+      if (tx.status !== 'pago') return; // somente pendente de credito ao vendedor
       const parcelas = parcelasCache[tx.id] || tx.parcelas;
-      const statusStr = tx.status === 'disponivel' || tx.status === 'pago' ? 'aprovado'
-        : tx.status === 'cancelado' || tx.status === 'devolvido' ? 'falhou' : tx.status;
-      const prev = calcPrevisaoRecebimento(tx.data, tx.metodo, parcelas, statusStr, 'pagbank');
-      if (prev && !prev.ja_disponivel) {
+      const prev = calcPrevisaoRecebimento(tx.data, tx.metodo, parcelas, 'aprovado', 'pagbank');
+      if (prev) {
         addEntry(prev.data_prevista, 0, tx.liquido || tx.bruto);
       }
     });
