@@ -1713,26 +1713,46 @@ app.get('/api/dashboard/resumo', async (req, res) => {
       s_a_receber = ((stripeBalance.pending || []).reduce((s, b) => s + b.amount, 0)) / 100;
 
       // MRR: mesma logica do /api/stripe/mrr — normaliza anual/semanal para mensal
+      // Conta assinaturas ativas por categoria
+      const sub_count = { variavel: 0, basico: 0, scale: 0, avancado: 0 };
       for (const sub of (activeSubs || [])) {
         for (const item of (sub.items?.data || [])) {
           const price = item.price;
           if (!price?.recurring) continue;
           let valor = (price.unit_amount || 0) / 100;
           const interval = price.recurring.interval;
-          const count = price.recurring.interval_count || 1;
-          if (interval === 'year') valor = (valor / 12) / count;
-          else if (interval === 'week') valor = (valor * 4.33) / count;
-          else if (interval === 'month') valor = valor / count;
+          const cnt = price.recurring.interval_count || 1;
+          if (interval === 'year') valor = (valor / 12) / cnt;
+          else if (interval === 'week') valor = (valor * 4.33) / cnt;
+          else if (interval === 'month') valor = valor / cnt;
           valor = valor * (item.quantity || 1);
           mrr += valor;
           const cat = classifyAssinatura(price.nickname || 'N/A', valor);
           mrr_cat[cat] = (mrr_cat[cat] || 0) + valor;
+          sub_count[cat] = (sub_count[cat] || 0) + 1;
         }
       }
+      // Novas e canceladas no período
+      const [newSubs, canceledSubs] = await Promise.all([
+        stripeListAll('subscriptions', { status: 'all', 'created[gte]': String(inicio), 'created[lte]': String(fim) }),
+        stripeListAll('subscriptions', { status: 'canceled', 'canceled_at[gte]': String(inicio), 'canceled_at[lte]': String(fim) }),
+      ]);
+      const s_novas = newSubs.filter(s => s.created >= inicio && s.created <= fim).length;
+      const s_cancelamentos = canceledSubs.length;
     }
 
+    // impl_tipos definido aqui para estar no scope do res.json
+    const impl_tipos = {
+      basica:        { count: 0, bruto: 0, liquido: 0 },
+      personalizada: { count: 0, bruto: 0, liquido: 0 },
+      avancada:      { count: 0, bruto: 0, liquido: 0 },
+      variavel:      { count: 0, bruto: 0, liquido: 0 },
+    };
     if (plataforma === 'ambas' || plataforma === 'pagbank') {
       const txs = await pagbankListAllTx(inicioPB, fimPB);
+      const refMapD = {}; txs.forEach(tx => { if (tx.referencia && !refMapD[tx.referencia]) refMapD[tx.referencia] = tx.id; });
+      await Promise.all(Object.entries(refMapD).map(([ref, code]) => fetchLinkNome(ref, code)));
+
       for (const tx of txs) {
         const isAprov = ['pago', 'disponivel'].includes(tx.status);
         const isCanc  = ['cancelado', 'devolvido', 'chargeback'].includes(tx.status);
@@ -1740,6 +1760,15 @@ app.get('/api/dashboard/resumo', async (req, res) => {
           p_bruto   += tx.bruto;
           p_liquido += tx.liquido;
           p_taxas   += (tx.bruto - tx.liquido);
+          // Classificar tipo de implementacao PagBank
+          const descricao = linkNomeCache[tx.referencia] || tx.link_pagamento || '';
+          const tipoImpl = classifyTipo(descricao, tx.bruto, tx.metodo, 'pagbank');
+          const tipoKey = tipoImpl === 'implementacao_avancada' ? 'avancada'
+            : tipoImpl === 'implementacao_personalizada' ? 'personalizada'
+            : tipoImpl === 'implementacao_basica' ? 'basica' : 'variavel';
+          impl_tipos[tipoKey].count++;
+          impl_tipos[tipoKey].bruto   = parseFloat((impl_tipos[tipoKey].bruto + tx.bruto).toFixed(2));
+          impl_tipos[tipoKey].liquido = parseFloat((impl_tipos[tipoKey].liquido + tx.liquido).toFixed(2));
           if (tx.status === 'pago') {
             p_a_receber += tx.liquido;
             const m = tx.metodo || 'cartao';
@@ -1763,15 +1792,27 @@ app.get('/api/dashboard/resumo', async (req, res) => {
       falhas:          round(s_falhas + p_falhas),
       stripe: {
         bruto: round(s_bruto), liquido: round(s_liquido), taxas: round(s_taxas),
-        falhas: round(s_falhas), a_receber: round(s_a_receber), mrr: round(mrr),
-        mrr_por_categoria: {
-          variavel: round(mrr_cat.variavel), basico: round(mrr_cat.basico),
-          scale: round(mrr_cat.scale), avancado: round(mrr_cat.avancado),
+        falhas: round(s_falhas), a_receber: round(s_a_receber),
+        mrr: round(mrr),
+        total_assinaturas: (sub_count.variavel + sub_count.basico + sub_count.scale + sub_count.avancado),
+        novas_assinaturas: s_novas,
+        cancelamentos: s_cancelamentos,
+        assinaturas_por_categoria: {
+          variavel:  { count: sub_count.variavel,  mrr: round(mrr_cat.variavel)  },
+          basico:    { count: sub_count.basico,    mrr: round(mrr_cat.basico)    },
+          scale:     { count: sub_count.scale,     mrr: round(mrr_cat.scale)     },
+          avancado:  { count: sub_count.avancado,  mrr: round(mrr_cat.avancado)  },
         },
       },
       pagbank: {
         bruto: round(p_bruto), liquido: round(p_liquido), taxas: round(p_taxas),
         falhas: round(p_falhas), a_receber: round(p_a_receber),
+        total_implementacoes: (impl_tipos.basica.count + impl_tipos.personalizada.count + impl_tipos.avancada.count),
+        implementacoes_por_tipo: {
+          basica:        { count: impl_tipos.basica.count,        bruto: impl_tipos.basica.bruto,        liquido: impl_tipos.basica.liquido        },
+          personalizada: { count: impl_tipos.personalizada.count, bruto: impl_tipos.personalizada.bruto, liquido: impl_tipos.personalizada.liquido },
+          avancada:      { count: impl_tipos.avancada.count,      bruto: impl_tipos.avancada.bruto,      liquido: impl_tipos.avancada.liquido      },
+        },
         pipeline: {
           cartao: round(pipeline.cartao), pix: round(pipeline.pix),
           boleto: round(pipeline.boleto), debito: round(pipeline.debito),
