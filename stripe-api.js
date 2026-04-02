@@ -389,15 +389,23 @@ app.get('/api/stripe/divisao-receita', async (req, res) => {
 
 app.get('/api/stripe/assinaturas/recentes', async (req, res) => {
   try {
-    // stripeRequest direto para suportar multiplos expand[] (stripeListAll nao suporta)
-    const result = await stripeRequest(
-      '/v1/subscriptions?status=all&limit=10' +
-      '&expand[]=data.customer' +
-      '&expand[]=data.items.data.price.product'
-    );
+    // Expandir apenas data.customer (expand duplo nao suportado em lista pelo Stripe)
+    const result = await stripeRequest('/v1/subscriptions?status=all&limit=10&expand[]=data.customer');
     const subs = result.data || [];
 
-    // Mapa email -> nome da subconta GHL (para exibir nome da empresa ao inves do email)
+    // Coletar IDs de produto unicos para buscar nomes em paralelo
+    const productIds = [...new Set(
+      subs.map(s => s.items?.data?.[0]?.price?.product).filter(id => id && typeof id === 'string')
+    )];
+    const productMap = {};
+    await Promise.all(productIds.slice(0, 15).map(async (pid) => {
+      try {
+        const prod = await stripeRequest('/v1/products/' + pid);
+        if (prod.name) productMap[pid] = prod.name;
+      } catch (e) {}
+    }));
+
+    // Mapa email -> nome da subconta GHL
     let ghlEmailMap = {};
     try {
       const ghlLocs = await ghlGetAllLocations();
@@ -405,24 +413,23 @@ app.get('/api/stripe/assinaturas/recentes', async (req, res) => {
         const em = (loc.email || '').toLowerCase().trim();
         if (em) ghlEmailMap[em] = loc.name || loc.nome || null;
       }
-    } catch (e) { /* fallback gracioso — sem nome GHL */ }
+    } catch (e) {}
 
     const recentes = subs.slice(0, 10).map(sub => {
       const item = sub.items?.data?.[0];
       const price = item?.price;
-      const product = typeof price?.product === 'object' ? price.product : null;
+      const productId = typeof price?.product === 'string' ? price.product : price?.product?.id;
+      const productName = productMap[productId] || null;
       const cust = typeof sub.customer === 'object' ? sub.customer : null;
       const email = cust?.email || sub.metadata?.email || null;
       const ghlNome = email ? ghlEmailMap[email.toLowerCase()] : null;
       return {
         id: sub.id,
         cliente_email: email || 'N/A',
-        // Preferencia: nome GHL (empresa) > nome do cliente Stripe > email
         cliente_nome: ghlNome || cust?.name || email || 'N/A',
-        // Plano: nickname do price > nome do produto Stripe (criado pelo GHL)
-        plano: price?.nickname || product?.name || 'N/A',
-        produto_id: product?.id || (typeof price?.product === 'string' ? price.product : null),
-        valor: price?.unit_amount ? price.unit_amount / 100 : (price?.unit_amount_decimal ? parseFloat(price.unit_amount_decimal) / 100 : 0),
+        plano: price?.nickname || productName || 'N/A',
+        produto_id: productId || null,
+        valor: price?.unit_amount ? price.unit_amount / 100 : 0,
         moeda: (price?.currency || 'brl').toUpperCase(),
         intervalo: price?.recurring?.interval === 'month' ? 'Mensal'
           : price?.recurring?.interval === 'year' ? 'Anual' : (price?.recurring?.interval || 'N/A'),
