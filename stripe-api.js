@@ -423,13 +423,16 @@ app.get('/api/stripe/assinaturas/recentes', async (req, res) => {
       const cust = typeof sub.customer === 'object' ? sub.customer : null;
       const email = cust?.email || sub.metadata?.email || null;
       const ghlNome = email ? ghlEmailMap[email.toLowerCase()] : null;
+      const planoNome = price?.nickname || productName || 'N/A';
+      const valor = price?.unit_amount ? price.unit_amount / 100 : 0;
       return {
         id: sub.id,
         cliente_email: email || 'N/A',
         cliente_nome: ghlNome || cust?.name || email || 'N/A',
-        plano: price?.nickname || productName || 'N/A',
+        plano: planoNome,
         produto_id: productId || null,
-        valor: price?.unit_amount ? price.unit_amount / 100 : 0,
+        categoria: classifyAssinatura(planoNome, valor),
+        valor,
         moeda: (price?.currency || 'brl').toUpperCase(),
         intervalo: price?.recurring?.interval === 'month' ? 'Mensal'
           : price?.recurring?.interval === 'year' ? 'Anual' : (price?.recurring?.interval || 'N/A'),
@@ -606,6 +609,24 @@ function xmlAll(xml, tag) {
 
 
 // Classifica o tipo de transação PagBank com base na descrição e valor
+// Classifica assinaturas Stripe em planos/categorias — prioridade: nome → valor
+function classifyAssinatura(nome, valor) {
+  const n = (nome || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  // Variaveis por nome: whatsapp, api, sms, ramal, uso, adicional, nao oficial, chatbot
+  if (/whatsapp|(\bapi\b)|\bapi\s|\bsms\b|ramal|\buso\b|adicional|extra|variav|nao oficial|chatbot|zap|waba/.test(n)) return 'variavel';
+  // Plano Avancado por nome
+  if (/avancado|advanced|premium|\bpro\b|enterprise|elite/.test(n)) return 'avancado';
+  // Plano Scale / Automatiza por nome
+  if (/\bscale\b|automatiza|escala/.test(n)) return 'scale';
+  // Plano Basico por nome
+  if (/\bbasic|\bbasico/.test(n)) return 'basico';
+  // Fallback por valor (criterio apenas Stripe)
+  if (valor < 300)  return 'variavel';  // abaixo de R$300
+  if (valor < 600)  return 'basico';    // R$300 - R$599
+  if (valor < 1000) return 'scale';     // R$600 - R$999
+  return 'avancado';                    // R$1000+
+}
+
 function classifyTipo(descricao, valor, metodo, plataforma) {
   if (metodo === 'recorrente') return 'assinatura';
   const desc = (descricao || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
