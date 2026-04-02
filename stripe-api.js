@@ -389,22 +389,43 @@ app.get('/api/stripe/divisao-receita', async (req, res) => {
 
 app.get('/api/stripe/assinaturas/recentes', async (req, res) => {
   try {
-    const subs = await stripeListAll('subscriptions', {
-      status: 'all',
-      limit: '10',
-    });
+    // stripeRequest direto para suportar multiplos expand[] (stripeListAll nao suporta)
+    const result = await stripeRequest(
+      '/v1/subscriptions?status=all&limit=10' +
+      '&expand[]=data.customer' +
+      '&expand[]=data.items.data.price.product'
+    );
+    const subs = result.data || [];
+
+    // Mapa email -> nome da subconta GHL (para exibir nome da empresa ao inves do email)
+    let ghlEmailMap = {};
+    try {
+      const ghlLocs = await ghlGetAllLocations();
+      for (const loc of ghlLocs) {
+        const em = (loc.email || '').toLowerCase().trim();
+        if (em) ghlEmailMap[em] = loc.name || loc.nome || null;
+      }
+    } catch (e) { /* fallback gracioso — sem nome GHL */ }
 
     const recentes = subs.slice(0, 10).map(sub => {
       const item = sub.items?.data?.[0];
       const price = item?.price;
-      const product = price?.product;
+      const product = typeof price?.product === 'object' ? price.product : null;
+      const cust = typeof sub.customer === 'object' ? sub.customer : null;
+      const email = cust?.email || sub.metadata?.email || null;
+      const ghlNome = email ? ghlEmailMap[email.toLowerCase()] : null;
       return {
         id: sub.id,
-        cliente_email: sub.customer?.email || sub.metadata?.email || 'N/A',
-        cliente_nome: sub.customer?.name || sub.metadata?.name || 'N/A',
-        plano: price?.nickname || (typeof product === 'object' ? product?.name : null) || 'N/A',
-        valor: price?.unit_amount ? price.unit_amount / 100 : 0,
-        intervalo: price?.recurring?.interval || 'N/A',
+        cliente_email: email || 'N/A',
+        // Preferencia: nome GHL (empresa) > nome do cliente Stripe > email
+        cliente_nome: ghlNome || cust?.name || email || 'N/A',
+        // Plano: nickname do price > nome do produto Stripe (criado pelo GHL)
+        plano: price?.nickname || product?.name || 'N/A',
+        produto_id: product?.id || (typeof price?.product === 'string' ? price.product : null),
+        valor: price?.unit_amount ? price.unit_amount / 100 : (price?.unit_amount_decimal ? parseFloat(price.unit_amount_decimal) / 100 : 0),
+        moeda: (price?.currency || 'brl').toUpperCase(),
+        intervalo: price?.recurring?.interval === 'month' ? 'Mensal'
+          : price?.recurring?.interval === 'year' ? 'Anual' : (price?.recurring?.interval || 'N/A'),
         status: sub.status,
         data_criacao: new Date(sub.created * 1000).toLocaleDateString('pt-BR'),
       };
