@@ -1696,7 +1696,7 @@ app.get('/api/dashboard/resumo', async (req, res) => {
           'created[gte]': String(inicio), 'created[lte]': String(fim),
           'expand[]': 'data.balance_transaction',
         }),
-        stripeRequest('/v1/subscriptions?status=active&limit=100&expand[]=data.items.data.price.product'),
+        stripeListAll('subscriptions', { status: 'active' }),
         stripeRequest('/v1/balance'),
       ]);
 
@@ -1712,14 +1712,22 @@ app.get('/api/dashboard/resumo', async (req, res) => {
 
       s_a_receber = ((stripeBalance.pending || []).reduce((s, b) => s + b.amount, 0)) / 100;
 
-      for (const sub of (activeSubs.data || [])) {
-        const price = sub.items?.data?.[0]?.price;
-        const product = typeof price?.product === 'object' ? price.product : null;
-        const planoNome = price?.nickname || product?.name || 'N/A';
-        const valor = price?.unit_amount ? price.unit_amount / 100 : 0;
-        mrr += valor;
-        const cat = classifyAssinatura(planoNome, valor);
-        mrr_cat[cat] = (mrr_cat[cat] || 0) + valor;
+      // MRR: mesma logica do /api/stripe/mrr — normaliza anual/semanal para mensal
+      for (const sub of (activeSubs || [])) {
+        for (const item of (sub.items?.data || [])) {
+          const price = item.price;
+          if (!price?.recurring) continue;
+          let valor = (price.unit_amount || 0) / 100;
+          const interval = price.recurring.interval;
+          const count = price.recurring.interval_count || 1;
+          if (interval === 'year') valor = (valor / 12) / count;
+          else if (interval === 'week') valor = (valor * 4.33) / count;
+          else if (interval === 'month') valor = valor / count;
+          valor = valor * (item.quantity || 1);
+          mrr += valor;
+          const cat = classifyAssinatura(price.nickname || 'N/A', valor);
+          mrr_cat[cat] = (mrr_cat[cat] || 0) + valor;
+        }
       }
     }
 
