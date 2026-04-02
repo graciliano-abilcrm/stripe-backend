@@ -1636,6 +1636,144 @@ app.get('/api/debug/link', async (req, res) => {
   }
 });
 
+// ─── DASHBOARD UNIFICADO ──────────────────────────────────────────────────────
+
+// GET /api/pagbank/transacoes/recentes — últimas N transações PagBank enriquecidas
+app.get('/api/pagbank/transacoes/recentes', async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit || '10'), 50);
+    const { inicio, fim } = getPeriodoPagbank(req);
+    const txs = await pagbankListAllTx(inicio, fim);
+
+    const refMap = {};
+    txs.forEach(tx => { if (tx.referencia && !refMap[tx.referencia]) refMap[tx.referencia] = tx.id; });
+    await Promise.all(Object.entries(refMap).map(([ref, code]) => fetchLinkNome(ref, code)));
+
+    const recentes = txs.slice(0, limit).map(tx => {
+      const sender = senderCache[tx.id] || {};
+      const parcelas = parcelasCache[tx.id] || tx.parcelas;
+      const statusStr = ['pago', 'disponivel'].includes(tx.status) ? 'aprovado'
+        : ['cancelado', 'devolvido', 'chargeback'].includes(tx.status) ? 'cancelado' : tx.status;
+      return {
+        id: tx.id,
+        data: tx.data,
+        data_br: tx.data ? tx.data.split('-').reverse().join('/') : 'N/A',
+        nome: sender.nome || (tx.nome && tx.nome !== 'N/A' ? tx.nome : null),
+        email: sender.email || (tx.email && tx.email !== 'N/A' ? tx.email : null),
+        descricao: linkNomeCache[tx.referencia] || tx.link_pagamento || null,
+        metodo: tx.metodo,
+        parcelas,
+        status: tx.status,
+        status_label: statusStr,
+        bruto: tx.bruto,
+        liquido: tx.liquido,
+        previsao_recebimento: calcPrevisaoRecebimento(tx.data, tx.metodo, parcelas, statusStr, 'pagbank'),
+      };
+    });
+
+    res.json({ transacoes: recentes, total: txs.length });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/dashboard/resumo — métricas unificadas Stripe + PagBank em uma chamada
+// Query params: plataforma=ambas|stripe|pagbank, start, end
+app.get('/api/dashboard/resumo', async (req, res) => {
+  try {
+    const plataforma = (req.query.plataforma || 'ambas').toLowerCase();
+    const { inicio, fim } = getPeriodo(req);
+    const { inicio: inicioPB, fim: fimPB } = getPeriodoPagbank(req);
+    const round = v => parseFloat((v || 0).toFixed(2));
+
+    let s_bruto = 0, s_liquido = 0, s_taxas = 0, s_falhas = 0, s_a_receber = 0;
+    let mrr = 0;
+    const mrr_cat = { variavel: 0, basico: 0, scale: 0, avancado: 0 };
+    let p_bruto = 0, p_liquido = 0, p_taxas = 0, p_falhas = 0, p_a_receber = 0;
+    const pipeline = { cartao: 0, pix: 0, boleto: 0, debito: 0 };
+
+    if (plataforma === 'ambas' || plataforma === 'stripe') {
+      const [charges, activeSubs, stripeBalance] = await Promise.all([
+        stripeListAll('charges', {
+          'created[gte]': String(inicio), 'created[lte]': String(fim),
+          'expand[]': 'data.balance_transaction',
+        }),
+        stripeRequest('/v1/subscriptions?status=active&limit=100&expand[]=data.items.data.price.product'),
+        stripeRequest('/v1/balance'),
+      ]);
+
+      for (const c of (charges || [])) {
+        if (c.status === 'succeeded') {
+          const bt = c.balance_transaction && typeof c.balance_transaction === 'object' ? c.balance_transaction : null;
+          s_bruto += (c.amount || 0) / 100;
+          if (bt) { s_liquido += (bt.net || 0) / 100; s_taxas += (bt.fee || 0) / 100; }
+        } else if (c.status === 'failed') {
+          s_falhas += (c.amount || 0) / 100;
+        }
+      }
+
+      s_a_receber = ((stripeBalance.pending || []).reduce((s, b) => s + b.amount, 0)) / 100;
+
+      for (const sub of (activeSubs.data || [])) {
+        const price = sub.items?.data?.[0]?.price;
+        const product = typeof price?.product === 'object' ? price.product : null;
+        const planoNome = price?.nickname || product?.name || 'N/A';
+        const valor = price?.unit_amount ? price.unit_amount / 100 : 0;
+        mrr += valor;
+        const cat = classifyAssinatura(planoNome, valor);
+        mrr_cat[cat] = (mrr_cat[cat] || 0) + valor;
+      }
+    }
+
+    if (plataforma === 'ambas' || plataforma === 'pagbank') {
+      const txs = await pagbankListAllTx(inicioPB, fimPB);
+      for (const tx of txs) {
+        const isAprov = ['pago', 'disponivel'].includes(tx.status);
+        const isCanc  = ['cancelado', 'devolvido', 'chargeback'].includes(tx.status);
+        if (isAprov) {
+          p_bruto   += tx.bruto;
+          p_liquido += tx.liquido;
+          p_taxas   += (tx.bruto - tx.liquido);
+          if (tx.status === 'pago') {
+            p_a_receber += tx.liquido;
+            const m = tx.metodo || 'cartao';
+            if (m === 'pix') pipeline.pix += tx.liquido;
+            else if (m === 'boleto') pipeline.boleto += tx.liquido;
+            else if (m === 'debito') pipeline.debito += tx.liquido;
+            else pipeline.cartao += tx.liquido;
+          }
+        } else if (isCanc) {
+          p_falhas += tx.bruto;
+        }
+      }
+    }
+
+    res.json({
+      plataforma,
+      receita_bruta:   round(s_bruto + p_bruto),
+      receita_liquida: round(s_liquido + p_liquido),
+      taxas:           round(s_taxas + p_taxas),
+      a_receber:       round(s_a_receber + p_a_receber),
+      falhas:          round(s_falhas + p_falhas),
+      stripe: {
+        bruto: round(s_bruto), liquido: round(s_liquido), taxas: round(s_taxas),
+        falhas: round(s_falhas), a_receber: round(s_a_receber), mrr: round(mrr),
+        mrr_por_categoria: {
+          variavel: round(mrr_cat.variavel), basico: round(mrr_cat.basico),
+          scale: round(mrr_cat.scale), avancado: round(mrr_cat.avancado),
+        },
+      },
+      pagbank: {
+        bruto: round(p_bruto), liquido: round(p_liquido), taxas: round(p_taxas),
+        falhas: round(p_falhas), a_receber: round(p_a_receber),
+        pipeline: {
+          cartao: round(pipeline.cartao), pix: round(pipeline.pix),
+          boleto: round(pipeline.boleto), debito: round(pipeline.debito),
+          total: round(p_a_receber),
+        },
+      },
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.listen(PORT, () => {
   console.log(`Stripe API backend rodando na porta ${PORT}`);
 });
