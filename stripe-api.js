@@ -1733,12 +1733,13 @@ app.get('/api/dashboard/resumo', async (req, res) => {
         }
       }
       // Novas e canceladas no período
+      // Stripe nao suporta canceled_at como filtro — busca canceladas e filtra em memoria por ended_at
       const [newSubs, canceledSubs] = await Promise.all([
         stripeListAll('subscriptions', { status: 'all', 'created[gte]': String(inicio), 'created[lte]': String(fim) }),
-        stripeListAll('subscriptions', { status: 'canceled', 'canceled_at[gte]': String(inicio), 'canceled_at[lte]': String(fim) }),
+        stripeListAll('subscriptions', { status: 'canceled', 'created[gte]': String(inicio - 180 * 86400) }),
       ]);
-      const s_novas = newSubs.filter(s => s.created >= inicio && s.created <= fim).length;
-      const s_cancelamentos = canceledSubs.length;
+      const s_novas = newSubs.length;
+      const s_cancelamentos = canceledSubs.filter(s => s.ended_at && s.ended_at >= inicio && s.ended_at <= fim).length;
     }
 
     // impl_tipos definido aqui para estar no scope do res.json
