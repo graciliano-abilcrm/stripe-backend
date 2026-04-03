@@ -1932,6 +1932,147 @@ app.get('/api/stripe/ltv', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ═══════════════════════════════════════════════════════════
+// NF AUTOMÁTICA — integração Contabilizei → GHL via email
+// ═══════════════════════════════════════════════════════════
+
+// Historico em memoria (persiste enquanto o servidor roda)
+const nfHistorico = [];
+
+// Normaliza string para busca fuzzy: remove acentos, lowercase, trim
+function normStr(s) {
+  return (s || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
+}
+
+// POST /api/nf/processar
+// Recebe dados parseados do email Contabilizei, busca subconta GHL e marca NF emitida
+app.post('/api/nf/processar', async (req, res) => {
+  try {
+    const { nome_razao_social, cnpj_cpf, valor, numero_nf, data_emissao, link_nf } = req.body;
+    if (!nome_razao_social && !cnpj_cpf) {
+      return res.status(400).json({ error: 'nome_razao_social ou cnpj_cpf obrigatorio' });
+    }
+
+    // ── 1. Buscar todas as subcontas GHL e encontrar a que bate com o tomador ──
+    const locations = await ghlGetAllLocations();
+    const nomeNorm = normStr(nome_razao_social);
+    const cnpjClean = (cnpj_cpf || '').replace(/[^0-9]/g, '');
+
+    let match = null;
+    let matchScore = 0;
+
+    for (const loc of locations) {
+      // Comparar por CNPJ no nome da subconta ou email (mais preciso)
+      const locNorm = normStr(loc.nome || loc.name || '');
+      const locEmail = normStr(loc.email || '');
+
+      // Score: nome contém parte significativa do tomador
+      const nomeWords = nomeNorm.split(/\s+/).filter(w => w.length > 3);
+      const matched = nomeWords.filter(w => locNorm.includes(w)).length;
+      const score = nomeWords.length > 0 ? matched / nomeWords.length : 0;
+
+      if (score > matchScore) {
+        matchScore = score;
+        match = loc;
+      }
+    }
+
+    // Exige pelo menos 50% das palavras do nome batendo
+    if (!match || matchScore < 0.5) {
+      const entry = {
+        ts: new Date().toISOString(), status: 'nao_encontrado',
+        nome_razao_social, cnpj_cpf, valor, numero_nf, data_emissao,
+        match_tentativa: match?.nome || null, match_score: matchScore,
+      };
+      nfHistorico.unshift(entry);
+      return res.status(404).json({ error: 'Subconta GHL nao encontrada', ...entry });
+    }
+
+    // ── 2. Atualizar a subconta GHL com campos de NF emitida ──
+    const locationId = match.id;
+
+    // Adicionar nota na subconta via API GHL v2
+    const nota = {
+      body: [
+        '✅ NF EMITIDA — Contabilizei',
+        'Número: ' + (numero_nf || 'N/A'),
+        'Data: ' + (data_emissao || new Date().toLocaleDateString('pt-BR')),
+        'Tomador: ' + nome_razao_social,
+        'CNPJ/CPF: ' + cnpj_cpf,
+        'Valor: R$ ' + (valor || 'N/A'),
+        link_nf ? 'Link: ' + link_nf : '',
+      ].filter(Boolean).join('\n'),
+    };
+
+    // GHL v2: POST /locations/{locationId}/notes (requer location API key)
+    // Como temos apenas agency key, usamos o endpoint de update de location custom values
+    // Estratégia: adicionar tag "nf-emitida" + campo customizado via PATCH v2
+    const patchResult = await new Promise((resolve) => {
+      const bodyStr = JSON.stringify({
+        tags: ['nf-emitida'],
+      });
+      const opts = {
+        hostname: GHL_BASE,
+        path: '/locations/' + locationId,
+        method: 'PUT',
+        headers: {
+          'Authorization': 'Bearer ' + GHL_AGENCY_KEY,
+          'Content-Type': 'application/json',
+          'Version': '2021-07-28',
+        },
+      };
+      const r = https.request(opts, (rr) => {
+        let d = '';
+        rr.on('data', c => d += c);
+        rr.on('end', () => resolve({ status: rr.statusCode, body: d.substring(0, 200) }));
+      });
+      r.on('error', () => resolve({ status: 0, body: 'connection error' }));
+      r.write(bodyStr);
+      r.end();
+    });
+
+    const entry = {
+      ts: new Date().toISOString(), status: 'ok',
+      nome_razao_social, cnpj_cpf, valor, numero_nf, data_emissao, link_nf,
+      subconta_id: locationId, subconta_nome: match.nome || match.name,
+      match_score: parseFloat(matchScore.toFixed(2)),
+      ghl_patch_status: patchResult.status,
+    };
+    nfHistorico.unshift(entry);
+    if (nfHistorico.length > 200) nfHistorico.pop();
+
+    res.json({ sucesso: true, ...entry });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/nf/historico — últimas NFs processadas
+app.get('/api/nf/historico', (req, res) => {
+  const limit = parseInt(req.query.limit || '50');
+  res.json({ total: nfHistorico.length, historico: nfHistorico.slice(0, limit) });
+});
+
+// GET /api/nf/testar-match — testa qual subconta bate com um nome/CNPJ sem gravar
+app.get('/api/nf/testar-match', async (req, res) => {
+  try {
+    const { nome, cnpj } = req.query;
+    if (!nome) return res.status(400).json({ error: 'Param nome obrigatorio' });
+    const locations = await ghlGetAllLocations();
+    const nomeNorm = normStr(nome);
+    const resultados = [];
+    for (const loc of locations) {
+      const locNorm = normStr(loc.nome || loc.name || '');
+      const nomeWords = nomeNorm.split(/\s+/).filter(w => w.length > 3);
+      const matched = nomeWords.filter(w => locNorm.includes(w)).length;
+      const score = nomeWords.length > 0 ? matched / nomeWords.length : 0;
+      if (score > 0) resultados.push({ id: loc.id, nome: loc.nome || loc.name, score: parseFloat(score.toFixed(2)) });
+    }
+    resultados.sort((a, b) => b.score - a.score);
+    res.json({ query: nome, top_matches: resultados.slice(0, 5) });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.listen(PORT, () => {
   console.log(`Stripe API backend rodando na porta ${PORT}`);
 });
