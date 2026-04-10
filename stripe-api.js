@@ -1837,85 +1837,70 @@ app.get('/api/dashboard/resumo', async (req, res) => {
 });
 
 // GET /api/stripe/ltv — LTV, valor médio por conta, ticket médio (respeita ?start=&end=)
-// ticket médio usa o PERÍODO FILTRADO — valor médio por conta tem 3 componentes separados
 app.get('/api/stripe/ltv', async (req, res) => {
   try {
     const agora = Date.now();
     const seisM = Math.floor((agora - 180 * 86400 * 1000) / 1000);
 
-    // Período selecionado (para ticket médio e valor médio por conta)
     const { inicio, fim } = getPeriodo(req);
     const { inicio: inicioPB, fim: fimPB } = getPeriodoPagbank(req);
-    // Número de meses no período (para mensurar variável/impl em termos mensais)
     const meses_periodo = Math.max(1, (fim - inicio) / (30.44 * 86400));
 
     const isAutoRecharge = c => /auto-recharge|sub-account/i.test(c.description || '');
 
-    // Fetch em paralelo:
-    // - charges_all: histórico completo → LTV histórico + ticket_assin all-time
-    // - charges_periodo: período filtrado → ticket médio impl/geral e variável GHL
-    // - activeSubs, canceledRecentes: para MRR, tempo de vida, churn
-    // - txsPagbank: período filtrado → ticket médio impl PagBank
-    const [charges_all, charges_periodo, activeSubs, canceledRecentes, txsPagbank] = await Promise.all([
-      stripeListAll('charges', { status: 'succeeded' }),
+    // Fetch em paralelo — SEM charges_all (lento demais):
+    // charges_periodo: período filtrado (assinatura + variável GHL)
+    // activeSubs + canceledRecentes: MRR, tempo de vida, churn
+    // txsPagbank: período filtrado — fonte principal de implementações
+    const [charges_periodo, activeSubs, canceledRecentes, txsPagbank] = await Promise.all([
       stripeListAll('charges', { status: 'succeeded', 'created[gte]': String(inicio), 'created[lte]': String(fim) }),
       stripeListAll('subscriptions', { status: 'active' }),
       stripeListAll('subscriptions', { status: 'canceled', 'created[gte]': String(seisM) }),
       pagbankListAllTx(inicioPB, fimPB),
     ]);
 
-    // Enriquece cache de nomes PagBank para melhor classificação
+    // Enriquece cache de nomes PagBank
     const refMapLTV = {};
     txsPagbank.forEach(tx => { if (tx.referencia && !refMapLTV[tx.referencia]) refMapLTV[tx.referencia] = tx.id; });
     await Promise.all(Object.entries(refMapLTV).map(([ref, code]) => fetchLinkNome(ref, code)));
 
-    // ── Classificar charges do PERÍODO ───────────────────────────────────
-    const periodo_assinatura  = charges_periodo.filter(c => c.invoice);
-    const periodo_ghl_var     = charges_periodo.filter(c => !c.invoice && isAutoRecharge(c));
-    const periodo_impl_stripe = charges_periodo.filter(c => !c.invoice && !isAutoRecharge(c));
-
-    // ── Receita Stripe período ────────────────────────────────────────────
-    let receita_assin_periodo = 0, receita_impl_stripe_periodo = 0, receita_ghl_var_periodo = 0;
+    // ── Stripe período — assinatura e variável GHL ────────────────────────
+    let receita_assin = 0, count_assin = 0;
+    let receita_ghl_var = 0, count_ghl_var = 0;
     for (const c of charges_periodo) {
       const v = (c.amount || 0) / 100;
-      if (c.invoice) receita_assin_periodo += v;
-      else if (isAutoRecharge(c)) receita_ghl_var_periodo += v;
-      else receita_impl_stripe_periodo += v;
+      if (c.invoice) { receita_assin += v; count_assin++; }
+      else if (isAutoRecharge(c)) { receita_ghl_var += v; count_ghl_var++; }
+      // Stripe avulsos não-GHL são ignorados: neste negócio implementações são PagBank
     }
 
-    // ── PagBank período — separar impl vs variável ────────────────────────
+    // ── PagBank período — impl vs variável ────────────────────────────────
+    // Implementações = transações PagBank classificadas como impl (não variavel)
+    // Variável PagBank = cobranças de uso/recorrência variável
     let receita_impl_pb = 0, count_impl_pb = 0;
     let receita_var_pb  = 0, count_var_pb  = 0;
     for (const tx of txsPagbank) {
       if (!['pago', 'disponivel'].includes(tx.status)) continue;
       const descricao = linkNomeCache[tx.referencia] || tx.link_pagamento || '';
       const tipo = classifyTipo(descricao, tx.bruto, tx.metodo, 'pagbank');
-      if (tipo !== 'variavel') {
-        receita_impl_pb += tx.liquido;
-        count_impl_pb++;
-      } else {
-        receita_var_pb += tx.liquido;
-        count_var_pb++;
-      }
+      if (tipo !== 'variavel') { receita_impl_pb += tx.liquido; count_impl_pb++; }
+      else                     { receita_var_pb  += tx.liquido; count_var_pb++;  }
     }
 
-    // ── Ticket médio — período filtrado ───────────────────────────────────
-    // Implementação: Stripe avulso real + PagBank implementações do período
-    const count_impl_total   = periodo_impl_stripe.length + count_impl_pb;
-    const receita_impl_total = receita_impl_stripe_periodo + receita_impl_pb;
-    const ticket_medio_implementacao = count_impl_total > 0
-      ? receita_impl_total / count_impl_total : 0;
+    // ── Ticket médio — SOMENTE PagBank para implementação ────────────────
+    // Lógica: implementações são 100% PagBank; Stripe avulso é ruído neste negócio
+    const ticket_medio_implementacao = count_impl_pb > 0
+      ? receita_impl_pb / count_impl_pb : 0;
 
-    // Assinatura: Stripe recorrente do período
-    const ticket_medio_assinatura = periodo_assinatura.length > 0
-      ? receita_assin_periodo / periodo_assinatura.length : 0;
+    const ticket_medio_assinatura = count_assin > 0
+      ? receita_assin / count_assin : 0;
 
-    // Geral: assinatura + impl (excluindo Auto-Recharge GHL que não é receita de negócio)
-    const count_geral   = periodo_assinatura.length + count_impl_total;
-    const receita_geral = receita_assin_periodo + receita_impl_total;
+    // Geral: (assinatura Stripe + impl PagBank) / (count_assin + count_impl_pb)
+    const count_geral   = count_assin + count_impl_pb;
+    const receita_geral = receita_assin + receita_impl_pb;
     const ticket_medio_geral = count_geral > 0 ? receita_geral / count_geral : 0;
 
-    // ── MRR e distribuição por categoria (sempre atual) ───────────────────
+    // ── MRR (sempre atual — não filtrado por período) ─────────────────────
     let mrr = 0;
     const mrr_por_cat   = { variavel: 0, basico: 0, scale: 0, avancado: 0 };
     const count_por_cat = { variavel: 0, basico: 0, scale: 0, avancado: 0 };
@@ -1941,32 +1926,19 @@ app.get('/api/stripe/ltv', async (req, res) => {
     }
 
     // ── Valor médio por conta — 3 componentes SEPARADOS ──────────────────
-    // Assinatura: MRR atual / contas com assinatura ativa (snapshot, sempre atual)
-    const contas_sub_ativas = clientesSub.size || 1;
-    const vmc_assinatura = mrr / contas_sub_ativas;
+    const contas = clientesSub.size || 1;
 
-    // Implementação: receita impl no período / meses_periodo / contas_sub_ativas
-    // Reflete quanto uma conta "consome" de implementação por mês em média
-    const vmc_implementacao = (receita_impl_total / meses_periodo) / contas_sub_ativas;
+    // Assinatura: MRR atual / contas ativas (snapshot atual, não filtrado por período)
+    const vmc_assinatura = mrr / contas;
 
-    // Variável GHL: Auto-Recharge Stripe + variáveis PagBank no período / meses / contas
-    const receita_var_total = receita_ghl_var_periodo + receita_var_pb;
-    const vmc_variavel = (receita_var_total / meses_periodo) / contas_sub_ativas;
+    // Implementação: receita impl PagBank do período / meses / contas
+    // "Se todo mês fosse como o período selecionado, cada conta traria X em impl/mês"
+    const vmc_implementacao = (receita_impl_pb / meses_periodo) / contas;
 
-    // Total = soma dos 3
+    // Variável GHL: (GHL auto-recharge Stripe + variáveis PagBank) / meses / contas
+    const vmc_variavel = ((receita_ghl_var + receita_var_pb) / meses_periodo) / contas;
+
     const valor_medio_conta = vmc_assinatura + vmc_implementacao + vmc_variavel;
-
-    // ── LTV histórico ─────────────────────────────────────────────────────
-    const clientesPagadores = new Set();
-    let receita_total_hist = 0;
-    for (const c of charges_all) {
-      if (isAutoRecharge(c)) continue;
-      receita_total_hist += (c.amount || 0) / 100;
-      if (c.customer) clientesPagadores.add(c.customer);
-    }
-    const total_clientes_pagadores = clientesPagadores.size;
-    const ltv_medio_historico = total_clientes_pagadores > 0
-      ? receita_total_hist / total_clientes_pagadores : 0;
 
     // ── LTV projetado ─────────────────────────────────────────────────────
     const tempos = activeSubs.map(s => (agora / 1000 - s.created) / (30.44 * 86400));
@@ -1982,44 +1954,38 @@ app.get('/api/stripe/ltv', async (req, res) => {
     const round = v => parseFloat((v || 0).toFixed(2));
 
     res.json({
-      // LTV
-      ltv_medio_historico: round(ltv_medio_historico),
       ltv_projetado: round(ltv_projetado),
 
-      // Valor médio por conta = 3 componentes SEPARADOS + total
       valor_medio_conta: round(valor_medio_conta),
       valor_medio_conta_breakdown: {
-        assinatura:     round(vmc_assinatura),     // MRR / contas ativas
-        implementacao:  round(vmc_implementacao),  // impl_período/meses / contas
-        variavel_ghl:   round(vmc_variavel),       // GHL autocharge/meses / contas
+        assinatura:    round(vmc_assinatura),    // MRR / contas — maior componente
+        implementacao: round(vmc_implementacao), // impl PagBank / meses / contas
+        variavel_ghl:  round(vmc_variavel),      // GHL + var PagBank / meses / contas
       },
 
-      // Ticket médio — PERÍODO FILTRADO (3 tipos)
-      ticket_medio_geral: round(ticket_medio_geral),           // por transação (excl. GHL)
-      ticket_medio_assinatura: round(ticket_medio_assinatura), // por cobrança recorrente
-      ticket_medio_implementacao: round(ticket_medio_implementacao), // por impl (Stripe+PagBank)
+      // Ticket médio — período selecionado
+      ticket_medio_geral: round(ticket_medio_geral),
+      ticket_medio_assinatura: round(ticket_medio_assinatura),
+      ticket_medio_implementacao: round(ticket_medio_implementacao), // = receita_impl_pb / count_impl_pb
 
-      // MRR e assinaturas
       mrr: round(mrr),
       assinaturas_ativas: activeSubs.length,
-
-      // Tempo e churn
       tempo_medio_vida_meses: round(tempo_medio_meses),
       churn_rate_mensal,
-
-      // Auditoria
-      total_clientes_pagadores,
       contas_sub_ativas: clientesSub.size,
       meses_periodo: round(meses_periodo),
-      total_cobranças_assinatura: periodo_assinatura.length,
-      total_cobranças_implementacao: count_impl_total,
-      total_cobranças_impl_stripe: periodo_impl_stripe.length,
-      total_cobranças_impl_pagbank: count_impl_pb,
-      total_ghl_variavel_excluido_do_ticket: periodo_ghl_var.length,
-      receita_impl_stripe_periodo: round(receita_impl_stripe_periodo),
-      receita_impl_pagbank_periodo: round(receita_impl_pb),
 
-      // Distribuição MRR por categoria
+      // Auditoria — para validar no browser
+      _debug: {
+        count_impl_pb,
+        receita_impl_pb: round(receita_impl_pb),
+        ticket_impl_check: count_impl_pb > 0 ? round(receita_impl_pb / count_impl_pb) : 0,
+        count_assin,
+        receita_assin: round(receita_assin),
+        count_ghl_var,
+        receita_ghl_var: round(receita_ghl_var),
+      },
+
       por_categoria: {
         variavel:  { count: count_por_cat.variavel,  mrr: round(mrr_por_cat.variavel)  },
         basico:    { count: count_por_cat.basico,    mrr: round(mrr_por_cat.basico)    },
