@@ -1875,16 +1875,18 @@ app.get('/api/stripe/ltv', async (req, res) => {
     }
 
     // ── PagBank período — impl vs variável ────────────────────────────────
-    // Implementações = transações PagBank classificadas como impl (não variavel)
-    // Variável PagBank = cobranças de uso/recorrência variável
+    // ATENÇÃO: classifyTipo para PagBank nunca retorna 'variavel' diretamente.
+    // Retorna 'assinatura' (metodo=recorrente) ou 'implementacao_*' (demais).
+    // Checar pelos tipos ESPECÍFICOS de implementação para não incluir recorrentes.
+    const IMPL_TIPOS = ['implementacao_basica', 'implementacao_personalizada', 'implementacao_avancada', 'implementacao'];
     let receita_impl_pb = 0, count_impl_pb = 0;
     let receita_var_pb  = 0, count_var_pb  = 0;
     for (const tx of txsPagbank) {
       if (!['pago', 'disponivel'].includes(tx.status)) continue;
       const descricao = linkNomeCache[tx.referencia] || tx.link_pagamento || '';
       const tipo = classifyTipo(descricao, tx.bruto, tx.metodo, 'pagbank');
-      if (tipo !== 'variavel') { receita_impl_pb += tx.liquido; count_impl_pb++; }
-      else                     { receita_var_pb  += tx.liquido; count_var_pb++;  }
+      if (IMPL_TIPOS.includes(tipo)) { receita_impl_pb += tx.liquido; count_impl_pb++; }
+      else                           { receita_var_pb  += tx.liquido; count_var_pb++;  }
     }
 
     // ── Ticket médio — SOMENTE PagBank para implementação ────────────────
