@@ -1841,41 +1841,64 @@ app.get('/api/stripe/ltv', async (req, res) => {
   try {
     const agora = Date.now();
 
-    // Busca em paralelo: cobranças bem-sucedidas (historico total), assinaturas ativas
-    const [charges, activeSubs] = await Promise.all([
+    // Busca em paralelo: cobranças (histórico total), assinaturas ativas, canceladas recentes
+    const dozeM = Math.floor((agora - 365 * 86400 * 1000) / 1000);
+    const seisM  = Math.floor((agora - 180 * 86400 * 1000) / 1000);
+    const [charges, activeSubs, canceledRecentes] = await Promise.all([
       stripeListAll('charges', { status: 'succeeded' }),
       stripeListAll('subscriptions', { status: 'active' }),
+      stripeListAll('subscriptions', { status: 'canceled', 'created[gte]': String(seisM) }),
     ]);
 
-    // ── Receita total historica e clientes ────────────────────────────────
+    // ── Separar charges por tipo ──────────────────────────────────────────
+    // c.invoice != null → cobrança recorrente (assinatura)
+    // c.invoice == null → cobrança avulsa (implementação / uso variável)
+    const cobranças_assinatura = charges.filter(c => c.invoice);
+    const cobranças_impl       = charges.filter(c => !c.invoice);
+
+    // Cobranças dos últimos 12 meses (para valor médio por conta — janela relevante)
+    const charges_12m = charges.filter(c => c.created >= dozeM);
+    const cobranças_assinatura_12m = charges_12m.filter(c => c.invoice);
+    const cobranças_impl_12m       = charges_12m.filter(c => !c.invoice);
+
+    // ── Receita total e por cliente ───────────────────────────────────────
     let receita_total = 0;
+    let receita_assinatura = 0;
+    let receita_impl = 0;
     const clientesPagadores = new Set();
-    const receitaPorCliente = {};
-    const cobrancasPorCliente = {};
+    const receitaPorCliente_12m = {}; // inclui assinatura + impl + variavel
 
     for (const c of charges) {
       const valor = (c.amount || 0) / 100;
-      const cid = c.customer;
       receita_total += valor;
-      if (cid) {
-        clientesPagadores.add(cid);
-        receitaPorCliente[cid] = (receitaPorCliente[cid] || 0) + valor;
-        cobrancasPorCliente[cid] = (cobrancasPorCliente[cid] || 0) + 1;
-      }
+      if (c.invoice) receita_assinatura += valor;
+      else receita_impl += valor;
+      if (c.customer) clientesPagadores.add(c.customer);
+    }
+    for (const c of charges_12m) {
+      const valor = (c.amount || 0) / 100;
+      const cid = c.customer;
+      if (cid) receitaPorCliente_12m[cid] = (receitaPorCliente_12m[cid] || 0) + valor;
     }
 
     const total_clientes_pagadores = clientesPagadores.size;
-    const ltv_medio = total_clientes_pagadores > 0
-      ? receita_total / total_clientes_pagadores : 0;
-    const ticket_medio = charges.length > 0
-      ? receita_total / charges.length : 0;
 
-    // ── MRR atual e valor medio por conta ────────────────────────────────
+    // ── Ticket médio (3 tipos) ────────────────────────────────────────────
+    const ticket_medio_geral          = charges.length > 0
+      ? receita_total / charges.length : 0;
+    const ticket_medio_assinatura     = cobranças_assinatura.length > 0
+      ? receita_assinatura / cobranças_assinatura.length : 0;
+    const ticket_medio_implementacao  = cobranças_impl.length > 0
+      ? receita_impl / cobranças_impl.length : 0;
+
+    // ── MRR atual e distribuição por categoria ────────────────────────────
     let mrr = 0;
-    const mrr_por_cat = { variavel: 0, basico: 0, scale: 0, avancado: 0 };
+    const mrr_por_cat   = { variavel: 0, basico: 0, scale: 0, avancado: 0 };
     const count_por_cat = { variavel: 0, basico: 0, scale: 0, avancado: 0 };
+    const clientesSub   = new Set(); // clientes com assinatura ativa
 
     for (const sub of activeSubs) {
+      if (sub.customer) clientesSub.add(sub.customer);
       for (const item of (sub.items?.data || [])) {
         const price = item.price;
         if (!price?.recurring) continue;
@@ -1893,23 +1916,29 @@ app.get('/api/stripe/ltv', async (req, res) => {
       }
     }
 
-    const valor_medio_conta = activeSubs.length > 0 ? mrr / activeSubs.length : 0;
+    // ── Valor médio por conta ─────────────────────────────────────────────
+    // = MRR (assinatura) + receita variável mensal (impl/avulso últ. 12m ÷ 12)
+    //   dividido pelo número de contas ativas únicas
+    const receita_impl_12m   = cobranças_impl_12m.reduce((s, c) => s + (c.amount || 0) / 100, 0);
+    const receita_assin_12m  = cobranças_assinatura_12m.reduce((s, c) => s + (c.amount || 0) / 100, 0);
+    const receita_total_12m  = receita_assin_12m + receita_impl_12m;
+    const contas_ativas_12m  = Object.keys(receitaPorCliente_12m).length;
+    const valor_medio_conta  = contas_ativas_12m > 0 ? receita_total_12m / contas_ativas_12m : 0;
+    // Breakdown do valor médio por conta
+    const valor_medio_assinatura_conta = clientesSub.size > 0 ? mrr / clientesSub.size : 0;
+    const valor_medio_impl_conta       = contas_ativas_12m > 0 ? (receita_impl_12m / 12) / contas_ativas_12m : 0;
 
-    // ── Tempo medio de vida das assinaturas ativas ────────────────────────
-    // Em meses, calculado pela data de criacao de cada assinatura
+    // ── Tempo médio de vida das assinaturas ativas ────────────────────────
     const tempos = activeSubs.map(s => (agora / 1000 - s.created) / (30.44 * 86400));
     const tempo_medio_meses = tempos.length > 0
       ? tempos.reduce((a, b) => a + b, 0) / tempos.length : 0;
 
-    // ── LTV projetado (MRR-based) ─────────────────────────────────────────
-    // LTV projetado = valor medio da conta × tempo medio de vida (meses)
+    // ── LTV histórico e projetado ─────────────────────────────────────────
+    const ltv_medio_historico = total_clientes_pagadores > 0
+      ? receita_total / total_clientes_pagadores : 0;
     const ltv_projetado = valor_medio_conta * tempo_medio_meses;
 
-    // ── Churn aproximado (ultimos 6 meses) ───────────────────────────────
-    const seisM = Math.floor((agora - 180 * 86400 * 1000) / 1000);
-    const canceledRecentes = await stripeListAll('subscriptions', {
-      status: 'canceled', 'created[gte]': String(seisM),
-    });
+    // ── Churn ─────────────────────────────────────────────────────────────
     const totalSubsBase = activeSubs.length + canceledRecentes.length;
     const churn_rate_mensal = totalSubsBase > 0
       ? parseFloat(((canceledRecentes.length / 6) / totalSubsBase * 100).toFixed(2)) : 0;
@@ -1918,23 +1947,34 @@ app.get('/api/stripe/ltv', async (req, res) => {
 
     res.json({
       // LTV
-      ltv_medio_historico: round(ltv_medio),         // receita total / clientes pagadores
-      ltv_projetado: round(ltv_projetado),           // valor medio conta × tempo medio vida
-      // Valor medio por conta
-      valor_medio_conta: round(valor_medio_conta),   // MRR / assinaturas ativas
-      ticket_medio: round(ticket_medio),             // receita total / numero de cobranças
-      // MRR
+      ltv_medio_historico: round(ltv_medio_historico),
+      ltv_projetado: round(ltv_projetado),
+      // Valor médio por conta (12 meses — assinatura + impl + variável)
+      valor_medio_conta: round(valor_medio_conta),
+      valor_medio_conta_breakdown: {
+        assinatura_mrr: round(valor_medio_assinatura_conta),   // MRR / contas com assinatura ativa
+        impl_variavel_mensal: round(valor_medio_impl_conta),   // receita impl/12m / contas únicas
+      },
+      // Ticket médio — 3 tipos
+      ticket_medio_geral: round(ticket_medio_geral),
+      ticket_medio_assinatura: round(ticket_medio_assinatura),
+      ticket_medio_implementacao: round(ticket_medio_implementacao),
+      // MRR e assinaturas
       mrr: round(mrr),
       assinaturas_ativas: activeSubs.length,
-      // Tempo
+      // Tempo e churn
       tempo_medio_vida_meses: round(tempo_medio_meses),
-      // Churn
-      churn_rate_mensal,                             // % estimado ao mes (ultimos 6 meses)
-      // Totais historicos
+      churn_rate_mensal,
+      // Totais históricos
       total_clientes_pagadores,
+      contas_ativas_12m,
       receita_total_historica: round(receita_total),
+      receita_assinatura_historica: round(receita_assinatura),
+      receita_implementacao_historica: round(receita_impl),
       total_cobranças: charges.length,
-      // Distribuicao por categoria
+      cobranças_assinatura: cobranças_assinatura.length,
+      cobranças_implementacao: cobranças_impl.length,
+      // Distribuição MRR por categoria
       por_categoria: {
         variavel:  { count: count_por_cat.variavel,  mrr: round(mrr_por_cat.variavel)  },
         basico:    { count: count_por_cat.basico,    mrr: round(mrr_por_cat.basico)    },
