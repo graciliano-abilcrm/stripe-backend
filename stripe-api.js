@@ -1743,12 +1743,13 @@ app.get('/api/dashboard/resumo', async (req, res) => {
 
     // impl_tipos definido aqui para estar no scope do res.json
     const impl_tipos = {
-      basica:        { count: 0, bruto: 0, liquido: 0 },
-      personalizada: { count: 0, bruto: 0, liquido: 0 },
-      avancada:      { count: 0, bruto: 0, liquido: 0 },
-      variavel:      { count: 0, bruto: 0, liquido: 0 },
+      basica:        { count: 0, bruto: 0, liquido: 0, parcelas_soma: 0 },
+      personalizada: { count: 0, bruto: 0, liquido: 0, parcelas_soma: 0 },
+      avancada:      { count: 0, bruto: 0, liquido: 0, parcelas_soma: 0 },
+      variavel:      { count: 0, bruto: 0, liquido: 0, parcelas_soma: 0 },
     };
     if (plataforma === 'ambas' || plataforma === 'pagbank') {
+      // Loop period-filtered: bruto, liquido, taxas, falhas, impl_tipos
       const txs = await pagbankListAllTx(inicioPB, fimPB);
       const refMapD = {}; txs.forEach(tx => { if (tx.referencia && !refMapD[tx.referencia]) refMapD[tx.referencia] = tx.id; });
       await Promise.all(Object.entries(refMapD).map(([ref, code]) => fetchLinkNome(ref, code)));
@@ -1760,7 +1761,6 @@ app.get('/api/dashboard/resumo', async (req, res) => {
           p_bruto   += tx.bruto;
           p_liquido += tx.liquido;
           p_taxas   += (tx.bruto - tx.liquido);
-          // Classificar tipo de implementacao PagBank
           const descricao = linkNomeCache[tx.referencia] || tx.link_pagamento || '';
           const tipoImpl = classifyTipo(descricao, tx.bruto, tx.metodo, 'pagbank');
           const tipoKey = tipoImpl === 'implementacao_avancada' ? 'avancada'
@@ -1769,16 +1769,29 @@ app.get('/api/dashboard/resumo', async (req, res) => {
           impl_tipos[tipoKey].count++;
           impl_tipos[tipoKey].bruto   = parseFloat((impl_tipos[tipoKey].bruto + tx.bruto).toFixed(2));
           impl_tipos[tipoKey].liquido = parseFloat((impl_tipos[tipoKey].liquido + tx.liquido).toFixed(2));
-          if (tx.status === 'pago') {
-            p_a_receber += tx.liquido;
-            const m = tx.metodo || 'cartao';
-            if (m === 'pix') pipeline.pix += tx.liquido;
-            else if (m === 'boleto') pipeline.boleto += tx.liquido;
-            else if (m === 'debito') pipeline.debito += tx.liquido;
-            else pipeline.cartao += tx.liquido;
-          }
+          impl_tipos[tipoKey].parcelas_soma += (parcelasCache[tx.id] || tx.parcelas || 1);
         } else if (isCanc) {
           p_falhas += tx.bruto;
+        }
+      }
+
+      // p_a_receber e pipeline: sempre últimos 60 dias (independente do filtro de período)
+      // Garante que o card "A Receber" mostra o saldo pendente real, não filtrado por data
+      const agoraBRT = new Date(new Date().getTime() - 3 * 60 * 60 * 1000);
+      const inicio60BRT = new Date(agoraBRT.getTime() - 60 * 24 * 60 * 60 * 1000);
+      const toBRTStr = (d) => {
+        const pad = n => String(n).padStart(2, '0');
+        return d.getUTCFullYear() + '-' + pad(d.getUTCMonth()+1) + '-' + pad(d.getUTCDate()) + 'T' + pad(d.getUTCHours()) + ':' + pad(d.getUTCMinutes());
+      };
+      const txsPendentes = await pagbankListAllTx(toBRTStr(inicio60BRT), toBRTStr(agoraBRT));
+      for (const tx of txsPendentes) {
+        if (tx.status === 'pago') {
+          p_a_receber += tx.liquido;
+          const m = tx.metodo || 'cartao';
+          if (m === 'pix') pipeline.pix += tx.liquido;
+          else if (m === 'boleto') pipeline.boleto += tx.liquido;
+          else if (m === 'debito') pipeline.debito += tx.liquido;
+          else pipeline.cartao += tx.liquido;
         }
       }
     }
@@ -1809,9 +1822,9 @@ app.get('/api/dashboard/resumo', async (req, res) => {
         falhas: round(p_falhas), a_receber: round(p_a_receber),
         total_implementacoes: (impl_tipos.basica.count + impl_tipos.personalizada.count + impl_tipos.avancada.count),
         implementacoes_por_tipo: {
-          basica:        { count: impl_tipos.basica.count,        bruto: impl_tipos.basica.bruto,        liquido: impl_tipos.basica.liquido        },
-          personalizada: { count: impl_tipos.personalizada.count, bruto: impl_tipos.personalizada.bruto, liquido: impl_tipos.personalizada.liquido },
-          avancada:      { count: impl_tipos.avancada.count,      bruto: impl_tipos.avancada.bruto,      liquido: impl_tipos.avancada.liquido      },
+          basica:        { count: impl_tipos.basica.count,        bruto: impl_tipos.basica.bruto,        liquido: impl_tipos.basica.liquido,        parcelas_media: impl_tipos.basica.count        > 0 ? round(impl_tipos.basica.parcelas_soma        / impl_tipos.basica.count)        : 0 },
+          personalizada: { count: impl_tipos.personalizada.count, bruto: impl_tipos.personalizada.bruto, liquido: impl_tipos.personalizada.liquido, parcelas_media: impl_tipos.personalizada.count > 0 ? round(impl_tipos.personalizada.parcelas_soma / impl_tipos.personalizada.count) : 0 },
+          avancada:      { count: impl_tipos.avancada.count,      bruto: impl_tipos.avancada.bruto,      liquido: impl_tipos.avancada.liquido,      parcelas_media: impl_tipos.avancada.count      > 0 ? round(impl_tipos.avancada.parcelas_soma      / impl_tipos.avancada.count)      : 0 },
         },
         pipeline: {
           cartao: round(pipeline.cartao), pix: round(pipeline.pix),
@@ -1943,6 +1956,70 @@ const nfHistorico = [];
 function normStr(s) {
   return (s || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').trim();
 }
+
+// GET /api/stripe/assinaturas/por-categoria — lista clientes de cada categoria para popup
+app.get('/api/stripe/assinaturas/por-categoria', async (req, res) => {
+  try {
+    const categorias = { variavel: [], basico: [], scale: [], avancado: [] };
+
+    // Busca todas as assinaturas ativas (sem expand — customer é string ID)
+    const activeSubs = await stripeListAll('subscriptions', { status: 'active' });
+
+    // Coleta IDs de clientes únicos para buscar nomes/emails em paralelo
+    const customerIds = [...new Set(activeSubs.map(s => s.customer).filter(id => typeof id === 'string'))];
+    const customerMap = {};
+    await Promise.all(
+      customerIds.map(async (cid) => {
+        try {
+          const c = await stripeRequest('/v1/customers/' + cid);
+          if (c.id) customerMap[c.id] = { nome: c.name || null, email: c.email || null };
+        } catch (e) {}
+      })
+    );
+
+    for (const sub of activeSubs) {
+      const item = sub.items?.data?.[0];
+      const price = item?.price;
+      if (!price?.recurring) continue;
+
+      let mrr = (price.unit_amount || 0) / 100;
+      const interval = price.recurring.interval;
+      const cnt = price.recurring.interval_count || 1;
+      if (interval === 'year') mrr = (mrr / 12) / cnt;
+      else if (interval === 'week') mrr = (mrr * 4.33) / cnt;
+      else if (interval === 'month') mrr = mrr / cnt;
+      mrr = mrr * (item.quantity || 1);
+
+      const plano = price.nickname || 'N/A';
+      const cat = classifyAssinatura(plano, mrr);
+      const cust = customerMap[sub.customer] || {};
+
+      categorias[cat].push({
+        sub_id: sub.id,
+        cliente_nome: cust.nome || cust.email || 'N/A',
+        cliente_email: cust.email || 'N/A',
+        plano,
+        mrr: parseFloat(mrr.toFixed(2)),
+        moeda: (price.currency || 'brl').toUpperCase(),
+        status: sub.status,
+        inicio: sub.start_date ? new Date(sub.start_date * 1000).toISOString().substring(0, 10) : null,
+      });
+    }
+
+    // Ordena por MRR desc dentro de cada categoria
+    for (const cat of Object.keys(categorias)) {
+      categorias[cat].sort((a, b) => b.mrr - a.mrr);
+    }
+
+    const round = v => parseFloat((v || 0).toFixed(2));
+    res.json({
+      variavel:  { count: categorias.variavel.length,  mrr_total: round(categorias.variavel.reduce((s,c)=>s+c.mrr,0)),  clientes: categorias.variavel  },
+      basico:    { count: categorias.basico.length,    mrr_total: round(categorias.basico.reduce((s,c)=>s+c.mrr,0)),    clientes: categorias.basico    },
+      scale:     { count: categorias.scale.length,     mrr_total: round(categorias.scale.reduce((s,c)=>s+c.mrr,0)),     clientes: categorias.scale     },
+      avancado:  { count: categorias.avancado.length,  mrr_total: round(categorias.avancado.reduce((s,c)=>s+c.mrr,0)),  clientes: categorias.avancado  },
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
 
 // POST /api/nf/processar
 // Recebe dados parseados do email Contabilizei, busca subconta GHL e marca NF emitida
