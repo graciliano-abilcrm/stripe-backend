@@ -1836,96 +1836,86 @@ app.get('/api/dashboard/resumo', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// GET /api/stripe/ltv — LTV medio, valor medio por conta, ticket medio, tempo de vida
+// GET /api/stripe/ltv — LTV, valor médio por conta, ticket médio (respeita ?start=&end=)
+// ticket médio usa o PERÍODO FILTRADO — valor médio por conta tem 3 componentes separados
 app.get('/api/stripe/ltv', async (req, res) => {
   try {
     const agora = Date.now();
-    const dozeM = Math.floor((agora - 365 * 86400 * 1000) / 1000);
     const seisM = Math.floor((agora - 180 * 86400 * 1000) / 1000);
 
-    // Helper: Auto-Recharge = recarga automática de subcontas GHL (não é implementação)
+    // Período selecionado (para ticket médio e valor médio por conta)
+    const { inicio, fim } = getPeriodo(req);
+    const { inicio: inicioPB, fim: fimPB } = getPeriodoPagbank(req);
+    // Número de meses no período (para mensurar variável/impl em termos mensais)
+    const meses_periodo = Math.max(1, (fim - inicio) / (30.44 * 86400));
+
     const isAutoRecharge = c => /auto-recharge|sub-account/i.test(c.description || '');
 
-    // Stripe + PagBank em paralelo
-    const agoraBRT    = new Date(agora - 3 * 60 * 60 * 1000);
-    const inicio12BRT = new Date(agora - 365 * 24 * 60 * 60 * 1000 - 3 * 60 * 60 * 1000);
-    const toBRTStr = (d) => {
-      const pad = n => String(n).padStart(2, '0');
-      return d.getUTCFullYear() + '-' + pad(d.getUTCMonth()+1) + '-' + pad(d.getUTCDate()) + 'T' + pad(d.getUTCHours()) + ':' + pad(d.getUTCMinutes());
-    };
-
-    const [charges, activeSubs, canceledRecentes, txsPagbank] = await Promise.all([
+    // Fetch em paralelo:
+    // - charges_all: histórico completo → LTV histórico + ticket_assin all-time
+    // - charges_periodo: período filtrado → ticket médio impl/geral e variável GHL
+    // - activeSubs, canceledRecentes: para MRR, tempo de vida, churn
+    // - txsPagbank: período filtrado → ticket médio impl PagBank
+    const [charges_all, charges_periodo, activeSubs, canceledRecentes, txsPagbank] = await Promise.all([
       stripeListAll('charges', { status: 'succeeded' }),
+      stripeListAll('charges', { status: 'succeeded', 'created[gte]': String(inicio), 'created[lte]': String(fim) }),
       stripeListAll('subscriptions', { status: 'active' }),
       stripeListAll('subscriptions', { status: 'canceled', 'created[gte]': String(seisM) }),
-      pagbankListAllTx(toBRTStr(inicio12BRT), toBRTStr(agoraBRT)),
+      pagbankListAllTx(inicioPB, fimPB),
     ]);
 
-    // ── Classificar charges Stripe ────────────────────────────────────────
-    // assinatura  = tem invoice (cobrança recorrente)
-    // ghl_variavel = Auto-Recharge (recarga subconta GHL — custo operacional, não receita de impl)
-    // impl_stripe  = avulso real (sem invoice e não é Auto-Recharge)
-    const cobranças_assinatura  = charges.filter(c => c.invoice);
-    const cobranças_ghl_var     = charges.filter(c => !c.invoice && isAutoRecharge(c));
-    const cobranças_impl_stripe = charges.filter(c => !c.invoice && !isAutoRecharge(c));
-
-    // Últimos 12 meses — para valor médio por conta
-    const charges_12m = charges.filter(c => c.created >= dozeM);
-    const receitaPorCliente_12m = {};
-    for (const c of charges_12m) {
-      if (c.customer && !isAutoRecharge(c)) {
-        const v = (c.amount || 0) / 100;
-        receitaPorCliente_12m[c.customer] = (receitaPorCliente_12m[c.customer] || 0) + v;
-      }
-    }
-
-    // ── Receita Stripe por tipo ───────────────────────────────────────────
-    let receita_total_stripe = 0, receita_assinatura = 0, receita_impl_stripe = 0;
-    const clientesPagadores = new Set();
-    for (const c of charges) {
-      const v = (c.amount || 0) / 100;
-      if (isAutoRecharge(c)) continue; // exclui Auto-Recharge do total de negócio
-      receita_total_stripe += v;
-      if (c.invoice) receita_assinatura += v;
-      else receita_impl_stripe += v;
-      if (c.customer) clientesPagadores.add(c.customer);
-    }
-
-    // ── PagBank — implementações (aprovadas, histórico 12m) ───────────────
-    // Enriquece cache de nomes para melhor classificação
+    // Enriquece cache de nomes PagBank para melhor classificação
     const refMapLTV = {};
     txsPagbank.forEach(tx => { if (tx.referencia && !refMapLTV[tx.referencia]) refMapLTV[tx.referencia] = tx.id; });
     await Promise.all(Object.entries(refMapLTV).map(([ref, code]) => fetchLinkNome(ref, code)));
 
-    let receita_impl_pagbank = 0;
-    let count_impl_pagbank   = 0;
+    // ── Classificar charges do PERÍODO ───────────────────────────────────
+    const periodo_assinatura  = charges_periodo.filter(c => c.invoice);
+    const periodo_ghl_var     = charges_periodo.filter(c => !c.invoice && isAutoRecharge(c));
+    const periodo_impl_stripe = charges_periodo.filter(c => !c.invoice && !isAutoRecharge(c));
+
+    // ── Receita Stripe período ────────────────────────────────────────────
+    let receita_assin_periodo = 0, receita_impl_stripe_periodo = 0, receita_ghl_var_periodo = 0;
+    for (const c of charges_periodo) {
+      const v = (c.amount || 0) / 100;
+      if (c.invoice) receita_assin_periodo += v;
+      else if (isAutoRecharge(c)) receita_ghl_var_periodo += v;
+      else receita_impl_stripe_periodo += v;
+    }
+
+    // ── PagBank período — separar impl vs variável ────────────────────────
+    let receita_impl_pb = 0, count_impl_pb = 0;
+    let receita_var_pb  = 0, count_var_pb  = 0;
     for (const tx of txsPagbank) {
       if (!['pago', 'disponivel'].includes(tx.status)) continue;
       const descricao = linkNomeCache[tx.referencia] || tx.link_pagamento || '';
       const tipo = classifyTipo(descricao, tx.bruto, tx.metodo, 'pagbank');
-      if (tipo !== 'variavel') { // implementacao_basica / personalizada / avancada
-        receita_impl_pagbank += tx.liquido;
-        count_impl_pagbank++;
+      if (tipo !== 'variavel') {
+        receita_impl_pb += tx.liquido;
+        count_impl_pb++;
+      } else {
+        receita_var_pb += tx.liquido;
+        count_var_pb++;
       }
     }
 
-    // ── Ticket médio — 3 tipos (Stripe + PagBank combinados) ─────────────
-    // Geral: assinaturas Stripe + implementações Stripe + implementações PagBank
-    const count_geral         = cobranças_assinatura.length + cobranças_impl_stripe.length + count_impl_pagbank;
-    const receita_geral       = receita_assinatura + receita_impl_stripe + receita_impl_pagbank;
-    const ticket_medio_geral  = count_geral > 0 ? receita_geral / count_geral : 0;
-
-    // Assinatura (só Stripe recorrente)
-    const ticket_medio_assinatura = cobranças_assinatura.length > 0
-      ? receita_assinatura / cobranças_assinatura.length : 0;
-
-    // Implementação (Stripe avulso real + PagBank implementações)
-    const count_impl_total        = cobranças_impl_stripe.length + count_impl_pagbank;
-    const receita_impl_total      = receita_impl_stripe + receita_impl_pagbank;
+    // ── Ticket médio — período filtrado ───────────────────────────────────
+    // Implementação: Stripe avulso real + PagBank implementações do período
+    const count_impl_total   = periodo_impl_stripe.length + count_impl_pb;
+    const receita_impl_total = receita_impl_stripe_periodo + receita_impl_pb;
     const ticket_medio_implementacao = count_impl_total > 0
       ? receita_impl_total / count_impl_total : 0;
 
-    // ── MRR e distribuição por categoria ─────────────────────────────────
+    // Assinatura: Stripe recorrente do período
+    const ticket_medio_assinatura = periodo_assinatura.length > 0
+      ? receita_assin_periodo / periodo_assinatura.length : 0;
+
+    // Geral: assinatura + impl (excluindo Auto-Recharge GHL que não é receita de negócio)
+    const count_geral   = periodo_assinatura.length + count_impl_total;
+    const receita_geral = receita_assin_periodo + receita_impl_total;
+    const ticket_medio_geral = count_geral > 0 ? receita_geral / count_geral : 0;
+
+    // ── MRR e distribuição por categoria (sempre atual) ───────────────────
     let mrr = 0;
     const mrr_por_cat   = { variavel: 0, basico: 0, scale: 0, avancado: 0 };
     const count_por_cat = { variavel: 0, basico: 0, scale: 0, avancado: 0 };
@@ -1950,24 +1940,38 @@ app.get('/api/stripe/ltv', async (req, res) => {
       }
     }
 
-    // ── Valor médio por conta (12 meses) ──────────────────────────────────
-    // MRR atual + receita de implementação mensal (12m ÷ 12) por conta
-    const contas_ativas_12m = Object.keys(receitaPorCliente_12m).length;
-    const impl_mensal_12m   = (receita_impl_stripe + receita_impl_pagbank) / 12;
-    const valor_medio_conta = clientesSub.size > 0
-      ? mrr / clientesSub.size + impl_mensal_12m / (contas_ativas_12m || 1) : 0;
-    const valor_medio_assinatura_conta = clientesSub.size > 0 ? mrr / clientesSub.size : 0;
-    const valor_medio_impl_conta       = contas_ativas_12m > 0 ? impl_mensal_12m / contas_ativas_12m : 0;
+    // ── Valor médio por conta — 3 componentes SEPARADOS ──────────────────
+    // Assinatura: MRR atual / contas com assinatura ativa (snapshot, sempre atual)
+    const contas_sub_ativas = clientesSub.size || 1;
+    const vmc_assinatura = mrr / contas_sub_ativas;
 
-    // ── Tempo médio de vida ───────────────────────────────────────────────
+    // Implementação: receita impl no período / meses_periodo / contas_sub_ativas
+    // Reflete quanto uma conta "consome" de implementação por mês em média
+    const vmc_implementacao = (receita_impl_total / meses_periodo) / contas_sub_ativas;
+
+    // Variável GHL: Auto-Recharge Stripe + variáveis PagBank no período / meses / contas
+    const receita_var_total = receita_ghl_var_periodo + receita_var_pb;
+    const vmc_variavel = (receita_var_total / meses_periodo) / contas_sub_ativas;
+
+    // Total = soma dos 3
+    const valor_medio_conta = vmc_assinatura + vmc_implementacao + vmc_variavel;
+
+    // ── LTV histórico ─────────────────────────────────────────────────────
+    const clientesPagadores = new Set();
+    let receita_total_hist = 0;
+    for (const c of charges_all) {
+      if (isAutoRecharge(c)) continue;
+      receita_total_hist += (c.amount || 0) / 100;
+      if (c.customer) clientesPagadores.add(c.customer);
+    }
+    const total_clientes_pagadores = clientesPagadores.size;
+    const ltv_medio_historico = total_clientes_pagadores > 0
+      ? receita_total_hist / total_clientes_pagadores : 0;
+
+    // ── LTV projetado ─────────────────────────────────────────────────────
     const tempos = activeSubs.map(s => (agora / 1000 - s.created) / (30.44 * 86400));
     const tempo_medio_meses = tempos.length > 0
       ? tempos.reduce((a, b) => a + b, 0) / tempos.length : 0;
-
-    // ── LTV ───────────────────────────────────────────────────────────────
-    const total_clientes_pagadores = clientesPagadores.size;
-    const ltv_medio_historico = total_clientes_pagadores > 0
-      ? receita_total_stripe / total_clientes_pagadores : 0;
     const ltv_projetado = valor_medio_conta * tempo_medio_meses;
 
     // ── Churn ─────────────────────────────────────────────────────────────
@@ -1975,36 +1979,47 @@ app.get('/api/stripe/ltv', async (req, res) => {
     const churn_rate_mensal = totalSubsBase > 0
       ? parseFloat(((canceledRecentes.length / 6) / totalSubsBase * 100).toFixed(2)) : 0;
 
-    const round = (v) => parseFloat((v || 0).toFixed(2));
+    const round = v => parseFloat((v || 0).toFixed(2));
 
     res.json({
+      // LTV
       ltv_medio_historico: round(ltv_medio_historico),
       ltv_projetado: round(ltv_projetado),
+
+      // Valor médio por conta = 3 componentes SEPARADOS + total
       valor_medio_conta: round(valor_medio_conta),
       valor_medio_conta_breakdown: {
-        assinatura_mrr:      round(valor_medio_assinatura_conta),
-        impl_variavel_mensal: round(valor_medio_impl_conta),
+        assinatura:     round(vmc_assinatura),     // MRR / contas ativas
+        implementacao:  round(vmc_implementacao),  // impl_período/meses / contas
+        variavel_ghl:   round(vmc_variavel),       // GHL autocharge/meses / contas
       },
-      // Ticket médio (3 tipos — Stripe + PagBank combinados)
-      ticket_medio_geral: round(ticket_medio_geral),
-      ticket_medio_assinatura: round(ticket_medio_assinatura),
-      ticket_medio_implementacao: round(ticket_medio_implementacao),
+
+      // Ticket médio — PERÍODO FILTRADO (3 tipos)
+      ticket_medio_geral: round(ticket_medio_geral),           // por transação (excl. GHL)
+      ticket_medio_assinatura: round(ticket_medio_assinatura), // por cobrança recorrente
+      ticket_medio_implementacao: round(ticket_medio_implementacao), // por impl (Stripe+PagBank)
+
+      // MRR e assinaturas
       mrr: round(mrr),
       assinaturas_ativas: activeSubs.length,
+
+      // Tempo e churn
       tempo_medio_vida_meses: round(tempo_medio_meses),
       churn_rate_mensal,
+
+      // Auditoria
       total_clientes_pagadores,
-      contas_ativas_12m,
-      receita_total_historica: round(receita_total_stripe),
-      receita_assinatura_historica: round(receita_assinatura),
-      receita_implementacao_historica: round(receita_impl_total),
-      receita_impl_stripe: round(receita_impl_stripe),
-      receita_impl_pagbank: round(receita_impl_pagbank),
-      total_cobranças_assinatura: cobranças_assinatura.length,
+      contas_sub_ativas: clientesSub.size,
+      meses_periodo: round(meses_periodo),
+      total_cobranças_assinatura: periodo_assinatura.length,
       total_cobranças_implementacao: count_impl_total,
-      total_cobranças_impl_stripe: cobranças_impl_stripe.length,
-      total_cobranças_impl_pagbank: count_impl_pagbank,
-      total_ghl_variavel_excluido: cobranças_ghl_var.length, // transparência
+      total_cobranças_impl_stripe: periodo_impl_stripe.length,
+      total_cobranças_impl_pagbank: count_impl_pb,
+      total_ghl_variavel_excluido_do_ticket: periodo_ghl_var.length,
+      receita_impl_stripe_periodo: round(receita_impl_stripe_periodo),
+      receita_impl_pagbank_periodo: round(receita_impl_pb),
+
+      // Distribuição MRR por categoria
       por_categoria: {
         variavel:  { count: count_por_cat.variavel,  mrr: round(mrr_por_cat.variavel)  },
         basico:    { count: count_por_cat.basico,    mrr: round(mrr_por_cat.basico)    },
