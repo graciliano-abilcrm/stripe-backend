@@ -628,7 +628,8 @@ function classifyAssinatura(nome, valor) {
 }
 
 function classifyTipo(descricao, valor, metodo, plataforma) {
-  if (metodo === 'recorrente') return 'assinatura';
+  // 'recorrente' só é assinatura no Stripe; no PagBank type 11 é apenas método de pagamento
+  if (metodo === 'recorrente' && plataforma !== 'pagbank') return 'assinatura';
   const desc = (descricao || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
   if (desc.includes('implementa')) {
     if (desc.includes('avancada') || valor > 5000) return 'implementacao_avancada';
@@ -1875,8 +1876,7 @@ app.get('/api/stripe/ltv', async (req, res) => {
     }
 
     // ── PagBank período — impl vs variável ────────────────────────────────
-    // ATENÇÃO: classifyTipo para PagBank nunca retorna 'variavel' diretamente.
-    // Retorna 'assinatura' (metodo=recorrente) ou 'implementacao_*' (demais).
+    // PagBank: classifyTipo classifica por valor (implementacao_*) — 'recorrente' não é assinatura no PagBank.
     // Checar pelos tipos ESPECÍFICOS de implementação para não incluir recorrentes.
     const IMPL_TIPOS = ['implementacao_basica', 'implementacao_personalizada', 'implementacao_avancada', 'implementacao'];
     let receita_impl_pb = 0, count_impl_pb = 0;
