@@ -2002,8 +2002,28 @@ app.get('/api/stripe/ltv', async (req, res) => {
 // NF AUTOMÁTICA — integração Contabilizei → GHL via email
 // ═══════════════════════════════════════════════════════════
 
-// Historico em memoria (persiste enquanto o servidor roda)
-const nfHistorico = [];
+// Historico NF em memória — indexado por mes_ano ("2026-04") + array geral
+const nfHistorico = [];           // todos os registros (compat. retroativa)
+const nfPorMes    = {};           // { "2026-04": [...] }
+
+function mesAnoAtual() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+}
+function addNfEntry(entry) {
+  const ma = entry.mes_ano || mesAnoAtual();
+  entry.mes_ano = ma;
+  nfHistorico.unshift(entry);
+  if (nfHistorico.length > 500) nfHistorico.pop();
+  if (!nfPorMes[ma]) nfPorMes[ma] = [];
+  // upsert por email ou nome normalizado
+  const idx = nfPorMes[ma].findIndex(e =>
+    (entry.email_cliente && e.email_cliente === entry.email_cliente) ||
+    normStr(e.nome_razao_social) === normStr(entry.nome_razao_social)
+  );
+  if (idx >= 0) nfPorMes[ma][idx] = entry;
+  else nfPorMes[ma].unshift(entry);
+}
 
 // Normaliza string para busca fuzzy: remove acentos, lowercase, trim
 function normStr(s) {
@@ -2114,7 +2134,7 @@ app.post('/api/nf/processar', async (req, res) => {
         nome_razao_social, cnpj_cpf, valor, numero_nf, data_emissao,
         match_tentativa: match?.nome || null, match_score: matchScore,
       };
-      nfHistorico.unshift(entry);
+      addNfEntry(entry);
       return res.status(404).json({ error: 'Subconta GHL nao encontrada', ...entry });
     }
 
@@ -2168,33 +2188,38 @@ app.post('/api/nf/processar', async (req, res) => {
       match_score: parseFloat(matchScore.toFixed(2)),
       ghl_patch_status: patchResult.status,
     };
-    nfHistorico.unshift(entry);
-    if (nfHistorico.length > 200) nfHistorico.pop();
-
+    addNfEntry(entry);
     res.json({ sucesso: true, ...entry });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// GET /api/nf/historico — últimas NFs processadas
+// GET /api/nf/historico — últimas NFs processadas (opcionalmente filtrar por ?mes=2026-04)
 app.get('/api/nf/historico', (req, res) => {
-  const limit = parseInt(req.query.limit || '50');
+  const limit = parseInt(req.query.limit || '100');
+  const mes   = req.query.mes; // ex: "2026-04"
+  if (mes) {
+    const entries = nfPorMes[mes] || [];
+    return res.json({ total: entries.length, historico: entries, mes });
+  }
   res.json({ total: nfHistorico.length, historico: nfHistorico.slice(0, limit) });
 });
 
-// POST /api/nf/marcar-manual — dá baixa manual na NF de um cliente
-// Body: { nome, email, numero_nf?, observacao? }
-app.post('/api/nf/marcar-manual', (req, res) => {
-  const { nome, email, numero_nf, observacao } = req.body;
-  if (!nome && !email) return res.status(400).json({ error: 'nome ou email obrigatorio' });
+// GET /api/nf/meses — lista de meses disponíveis no histórico
+app.get('/api/nf/meses', (req, res) => {
+  const meses = Object.keys(nfPorMes).sort().reverse();
+  // garante que o mês corrente aparece sempre
+  const atual = mesAnoAtual();
+  if (!meses.includes(atual)) meses.unshift(atual);
+  res.json({ meses, atual });
+});
 
-  // Evita duplicata: se já existe entrada manual/ok para esse cliente, atualiza
-  const nomeNorm = normStr(nome || '');
-  const idx = nfHistorico.findIndex(n => {
-    if (n.origem !== 'manual') return false;
-    return normStr(n.nome_razao_social) === nomeNorm || (email && n.email_cliente === email);
-  });
+// POST /api/nf/marcar-manual — dá baixa manual na NF de um cliente
+// Body: { nome, email, numero_nf?, observacao?, mes_ano? }
+app.post('/api/nf/marcar-manual', (req, res) => {
+  const { nome, email, numero_nf, observacao, tipo_nf } = req.body;
+  if (!nome && !email) return res.status(400).json({ error: 'nome ou email obrigatorio' });
 
   const entry = {
     ts: new Date().toISOString(),
@@ -2204,28 +2229,37 @@ app.post('/api/nf/marcar-manual', (req, res) => {
     email_cliente: email || null,
     numero_nf: numero_nf || null,
     observacao: observacao || null,
+    tipo_nf: tipo_nf || 'mensal',   // 'mensal' | 'implementacao'
+    mes_ano: mesAnoAtual(),
   };
 
-  if (idx >= 0) {
-    nfHistorico[idx] = entry; // atualiza existente
-  } else {
-    nfHistorico.unshift(entry);
-    if (nfHistorico.length > 200) nfHistorico.pop();
-  }
-
+  addNfEntry(entry);
   res.json({ sucesso: true, ...entry });
 });
 
 // DELETE /api/nf/remover-manual — desfaz baixa manual de um cliente
-// Body: { nome?, email? }
+// Body: { nome?, email?, mes_ano? }
 app.delete('/api/nf/remover-manual', (req, res) => {
-  const { nome, email } = req.body;
+  const { nome, email, mes_ano } = req.body;
   if (!nome && !email) return res.status(400).json({ error: 'nome ou email obrigatorio' });
   const nomeNorm = normStr(nome || '');
+  const ma = mes_ano || mesAnoAtual();
+
+  // Remove do mês específico
+  if (nfPorMes[ma]) {
+    nfPorMes[ma] = nfPorMes[ma].filter(n => {
+      if (n.origem !== 'manual') return true;
+      const matchNome  = nome  && normStr(n.nome_razao_social) === nomeNorm;
+      const matchEmail = email && n.email_cliente === email;
+      return !(matchNome || matchEmail);
+    });
+  }
+  // Remove do array geral
   const antes = nfHistorico.length;
   const filtrados = nfHistorico.filter(n => {
-    if (n.origem !== 'manual') return true; // nunca remove entradas automáticas
-    const matchNome = nome && normStr(n.nome_razao_social) === nomeNorm;
+    if (n.origem !== 'manual') return true;
+    if (n.mes_ano && n.mes_ano !== ma) return true; // só remove do mês alvo
+    const matchNome  = nome  && normStr(n.nome_razao_social) === nomeNorm;
     const matchEmail = email && n.email_cliente === email;
     return !(matchNome || matchEmail);
   });
@@ -2337,9 +2371,24 @@ app.get('/api/clientes/kpis', async (req, res) => {
     const contas_ativas = clientesSub.size || 1;
     const valor_medio_mensal = mrr / contas_ativas;
 
+    // ── Clientes implementação (Stripe sem sub ativa, com cobrança real no período) ──
+    const implClientes = new Set();
+    for (const ch of succeeded) {
+      const cid = ch.customer || ch.billing_details?.email || ch.id;
+      if (!_isAutoRecharge(ch) && !ativoSubIdsKpi.has(cid)) {
+        implClientes.add(cid);
+      }
+    }
+    const total_implementacao = implClientes.size;
+    // total_ativos = assinaturas ativas (fonte de verdade), não charges do período
+    const total_ativos = activeSubs.length;
+    const total_clientes_todos = total_ativos + total_implementacao;
+
     const r = v => parseFloat((v || 0).toFixed(2));
     res.json({
-      total_clientes,
+      total_clientes: total_clientes_todos,
+      total_ativos,
+      total_implementacao,
       ticket_medio_cliente: r(ticket_medio_cliente),
       mrr: r(mrr),
       ltv: r(ltv),
@@ -2356,16 +2405,18 @@ app.get('/api/clientes/kpis', async (req, res) => {
 // Identifica cobranças que são recargas automáticas de subconta GHL — NÃO são clientes reais
 const _isAutoRecharge = ch => /auto-recharge|sub-account/i.test(ch.description || '');
 
-// GET /api/clientes/todos — clientes classificados: ativo | sem_assinatura | variavel
+// GET /api/clientes/todos — clientes classificados: ativo | implementacao | variavel
 // tipo_cliente:
 //   'ativo'          → tem assinatura ativa no Stripe
-//   'sem_assinatura' → tem cobranças reais mas sem sub ativa (futuro cliente / lapsado)
+//   'implementacao'  → cobranças reais no Stripe mas sem sub ativa (implementação paga / aguardando)
 //   'variavel'       → cobranças são apenas auto-recharge/GHL (não é cliente real)
 // Por padrão filtra fora 'variavel'. Passar ?incluir_variaveis=true para ver tudo.
+// Passar ?mes=2026-04 para filtrar NF pelo mês específico.
 app.get('/api/clientes/todos', async (req, res) => {
   try {
     const { inicio, fim } = getPeriodo(req);
     const incluirVariaveis = req.query.incluir_variaveis === 'true';
+    const mes = req.query.mes || mesAnoAtual();
 
     // Busca em paralelo: charges do período, assinaturas ativas, customers
     const [charges, activeSubs, allCustomers] = await Promise.all([
@@ -2386,7 +2437,7 @@ app.get('/api/clientes/todos', async (req, res) => {
       custMap[c.id] = { nome: c.name || '', email: c.email || '', created: c.created };
     }
 
-    // Agrupa cobranças por cliente, separando real vs auto-recharge
+    // Agrupa cobranças por cliente
     const porCliente = {};
     for (const ch of charges.filter(c => c.status === 'succeeded')) {
       const cid = ch.customer || ch.billing_details?.email || 'sem-id';
@@ -2418,8 +2469,39 @@ app.get('/api/clientes/todos', async (req, res) => {
       if (ch.created > porCliente[cid].ultima_cobranca) porCliente[cid].ultima_cobranca = ch.created;
     }
 
-    // Cross-reference NF emitida por nome (fuzzy)
-    const nfOk = nfHistorico.filter(n => n.status === 'ok');
+    // ── Garante que TODOS os clientes com sub ativa aparecem, mesmo sem cobrança no período ──
+    for (const sub of activeSubs) {
+      const cid = sub.customer;
+      if (!cid || porCliente[cid]) continue; // já está no mapa
+      const custInfo = custMap[cid] || {};
+      if (!custInfo.nome && !custInfo.email) continue; // sem dados, ignora
+      porCliente[cid] = {
+        id: cid,
+        nome: custInfo.nome || custInfo.email || 'N/A',
+        email: custInfo.email || '',
+        total: 0, count: 0,
+        total_variavel: 0, count_variavel: 0,
+        tem_cobranca_real: false,   // sem cobrança no período mas tem sub ativa
+        primeira_cobranca: sub.created,
+        ultima_cobranca: sub.current_period_start || sub.created,
+        customer_criado: custInfo.created || null,
+      };
+    }
+
+    // ── NF do mês solicitado ──
+    const nfMes = nfPorMes[mes] || nfHistorico.filter(n => n.mes_ano === mes);
+    const nfOk  = nfMes.filter(n => n.status === 'ok');
+
+    // Função fuzzy de NF
+    function nfMatch(nomeCl) {
+      const nomeNorm = normStr(nomeCl);
+      return nfOk.find(n => {
+        const nfNorm = normStr(n.nome_razao_social);
+        const words  = nfNorm.split(/\s+/).filter(w => w.length > 3);
+        if (words.length === 0) return normStr(n.email_cliente) === normStr(nomeCl);
+        return words.filter(w => nomeNorm.includes(w)).length / words.length >= 0.5;
+      });
+    }
 
     const clientes = Object.values(porCliente).map(cl => {
       // Classificação
@@ -2427,19 +2509,12 @@ app.get('/api/clientes/todos', async (req, res) => {
       if (ativoSubIds.has(cl.id)) {
         tipo_cliente = 'ativo';
       } else if (cl.tem_cobranca_real) {
-        tipo_cliente = 'sem_assinatura'; // futuro cliente ou lapsado
+        tipo_cliente = 'implementacao'; // cobrança real mas sem sub → implementação paga aguardando sub
       } else {
-        tipo_cliente = 'variavel'; // apenas auto-recharge GHL — não é cliente
+        tipo_cliente = 'variavel';
       }
 
-      // NF emitida
-      const nomeNorm = normStr(cl.nome);
-      const nf = nfOk.find(n => {
-        const nfNorm = normStr(n.nome_razao_social);
-        const words = nfNorm.split(/\s+/).filter(w => w.length > 3);
-        if (words.length === 0) return false;
-        return words.filter(w => nomeNorm.includes(w)).length / words.length >= 0.5;
-      });
+      const nf = nfMatch(cl.nome) || (cl.email ? nfMatch(cl.email) : null);
 
       return {
         id: cl.id,
@@ -2451,18 +2526,25 @@ app.get('/api/clientes/todos', async (req, res) => {
         nf_emitida: !!nf,
         nf_numero: nf?.numero_nf || null,
         nf_data: nf?.data_emissao || null,
-        ultima_cobranca_fmt: new Date(cl.ultima_cobranca * 1000).toLocaleDateString('pt-BR'),
+        ultima_cobranca_fmt: cl.ultima_cobranca
+          ? new Date(cl.ultima_cobranca * 1000).toLocaleDateString('pt-BR') : '-',
       };
     });
 
-    // Filtra: por padrão exclui 'variavel' (auto-recharge GHL, não são clientes)
+    // Filtra: por padrão exclui 'variavel'
     const filtrados = clientes.filter(cl => incluirVariaveis || cl.tipo_cliente !== 'variavel');
-    filtrados.sort((a, b) => b.total - a.total);
+    filtrados.sort((a, b) => {
+      // ativos primeiro, depois implementacao, depois por valor
+      const order = { ativo: 0, implementacao: 1, variavel: 2 };
+      const od = (order[a.tipo_cliente] || 0) - (order[b.tipo_cliente] || 0);
+      return od !== 0 ? od : b.total - a.total;
+    });
 
     res.json({
       total: filtrados.length,
       total_ativos: filtrados.filter(c => c.tipo_cliente === 'ativo').length,
-      total_sem_assinatura: filtrados.filter(c => c.tipo_cliente === 'sem_assinatura').length,
+      total_implementacao: filtrados.filter(c => c.tipo_cliente === 'implementacao').length,
+      mes,
       clientes: filtrados,
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
