@@ -2614,6 +2614,132 @@ app.get('/api/clientes/metricas', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ============================================================
+// HISTÓRICO DO CLIENTE — GET /api/clientes/:customerId/historico
+// ============================================================
+// Retorna: info do cliente, todas as cobranças (lifetime), assinatura atual,
+//          métricas (total pago, ticket médio, tempo, breakdowns), NFs emitidas.
+app.get('/api/clientes/:customerId/historico', async (req, res) => {
+  try {
+    const { customerId } = req.params;
+    if (!customerId) return res.status(400).json({ error: 'customerId obrigatorio' });
+
+    // Busca em paralelo
+    const [allCharges, activeSubs, customer] = await Promise.all([
+      stripeListAll('charges', { customer: customerId }),
+      stripeListAll('subscriptions', { customer: customerId, status: 'all' }),
+      fetch(`https://api.stripe.com/v1/customers/${customerId}`, {
+        headers: { Authorization: `Bearer ${process.env.STRIPE_SECRET_KEY}` },
+      }).then(r => r.json()).catch(() => null),
+    ]);
+
+    const nome  = customer?.name  || customer?.email || 'N/A';
+    const email = customer?.email || '';
+    const criado_em = customer?.created
+      ? new Date(customer.created * 1000).toLocaleDateString('pt-BR') : null;
+
+    const agora = Math.floor(Date.now() / 1000);
+    const primeiraCobranca = allCharges.length > 0
+      ? Math.min(...allCharges.map(c => c.created)) : (customer?.created || agora);
+    const mesesConosco = parseFloat(((agora - primeiraCobranca) / (30.44 * 86400)).toFixed(1));
+
+    // Classifica cada cobrança
+    let total_mensalidade = 0, count_mensalidade = 0;
+    let total_variavel    = 0, count_variavel    = 0;
+    let total_impl        = 0, count_impl        = 0;
+
+    const cobranças = allCharges
+      .filter(c => c.status === 'succeeded')
+      .sort((a, b) => b.created - a.created)
+      .map(c => {
+        const valor = (c.amount || 0) / 100;
+        let tipo;
+        if (c.invoice)            { tipo = 'mensalidade'; total_mensalidade += valor; count_mensalidade++; }
+        else if (_isAutoRecharge(c)) { tipo = 'variavel';    total_variavel    += valor; count_variavel++;    }
+        else                      { tipo = 'implementacao'; total_impl        += valor; count_impl++;        }
+        return {
+          id: c.id,
+          data: new Date(c.created * 1000).toLocaleDateString('pt-BR'),
+          data_ts: c.created,
+          descricao: c.description || c.statement_descriptor || '-',
+          valor: parseFloat(valor.toFixed(2)),
+          tipo,
+          invoice_id: c.invoice || null,
+        };
+      });
+
+    const total_pago    = parseFloat((total_mensalidade + total_variavel + total_impl).toFixed(2));
+    const total_real    = parseFloat((total_mensalidade + total_impl).toFixed(2)); // exclui variável
+    const ticket_medio  = cobranças.length > 0
+      ? parseFloat((total_pago / cobranças.length).toFixed(2)) : 0;
+
+    // Assinatura atual (mais recente ativa ou canceled)
+    const subAtiva = activeSubs.find(s => s.status === 'active') || null;
+    let mrr_atual = 0;
+    let plano_atual = null;
+    if (subAtiva) {
+      for (const item of (subAtiva.items?.data || [])) {
+        const price = item.price;
+        if (!price?.recurring) continue;
+        let v = (price.unit_amount || 0) / 100;
+        if (price.recurring.interval === 'year') v /= 12;
+        mrr_atual += v * (item.quantity || 1);
+        plano_atual = price.nickname || price.id;
+      }
+    }
+
+    // NFs emitidas para este cliente (busca em todo o histórico por email/nome)
+    const nomeNorm = normStr(nome);
+    const emailNorm = normStr(email);
+    const nfsCliente = nfHistorico.filter(n => {
+      if (email && n.email_cliente === email) return true;
+      const nfNorm = normStr(n.nome_razao_social);
+      const words  = nfNorm.split(/\s+/).filter(w => w.length > 3);
+      if (words.length === 0) return false;
+      return words.filter(w => nomeNorm.includes(w)).length / words.length >= 0.5;
+    });
+
+    const r = v => parseFloat((v || 0).toFixed(2));
+    res.json({
+      cliente: { id: customerId, nome, email, criado_em, meses_conosco: mesesConosco },
+      metricas: {
+        total_pago: r(total_pago),
+        total_real: r(total_real),
+        total_mensalidade: r(total_mensalidade),
+        total_implementacao: r(total_impl),
+        total_variavel: r(total_variavel),
+        ticket_medio,
+        meses_conosco: mesesConosco,
+        mrr_atual: r(mrr_atual),
+        plano_atual,
+        count_cobranças: cobranças.length,
+        count_mensalidade,
+        count_impl,
+        count_variavel,
+      },
+      assinatura: subAtiva ? {
+        id: subAtiva.id,
+        status: subAtiva.status,
+        inicio: new Date(subAtiva.created * 1000).toLocaleDateString('pt-BR'),
+        proximo_vencimento: subAtiva.current_period_end
+          ? new Date(subAtiva.current_period_end * 1000).toLocaleDateString('pt-BR') : null,
+        plano: plano_atual,
+        mrr: r(mrr_atual),
+      } : null,
+      cobranças,
+      notas_fiscais: nfsCliente.map(n => ({
+        mes_ano: n.mes_ano || null,
+        data: n.data_emissao || n.ts?.slice(0, 10) || null,
+        numero_nf: n.numero_nf || null,
+        status: n.status,
+        origem: n.origem,
+        valor: n.valor || null,
+        nome_razao_social: n.nome_razao_social,
+      })),
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.listen(PORT, () => {
   console.log(`Stripe API backend rodando na porta ${PORT}`);
 });
