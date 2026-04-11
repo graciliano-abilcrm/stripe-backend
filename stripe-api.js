@@ -2224,17 +2224,31 @@ app.get('/api/clientes/kpis', async (req, res) => {
 
     const succeeded = charges.filter(c => c.status === 'succeeded');
 
-    // ── Total clientes únicos com pagamento no período ──
-    const clientesSet = new Set();
-    let receita_total = 0;
+    // IDs de customers com assinatura ativa
+    const ativoSubIdsKpi = new Set(activeSubs.map(s => s.customer).filter(Boolean));
+
+    // ── Total clientes reais: excluir quem só tem auto-recharge (variável GHL) ──
+    const clientesReais = new Set();    // ativo ou sem_assinatura
+    const clienteSoVariavel = new Set(); // apenas auto-recharge
+    const receitaPorCliente = {};
+
     for (const ch of succeeded) {
       const cid = ch.customer || ch.billing_details?.email || ch.id;
-      clientesSet.add(cid);
-      receita_total += (ch.amount || 0) / 100;
+      const valor = (ch.amount || 0) / 100;
+      if (!_isAutoRecharge(ch)) {
+        clientesReais.add(cid);
+        receitaPorCliente[cid] = (receitaPorCliente[cid] || 0) + valor;
+      } else {
+        if (!clientesReais.has(cid)) clienteSoVariavel.add(cid);
+      }
     }
-    const total_clientes = clientesSet.size || 1;
+    // Remove do soVariavel quem acabou entrando em reais também
+    for (const cid of clientesReais) clienteSoVariavel.delete(cid);
 
-    // ── Ticket médio por cliente (receita período / clientes únicos) ──
+    const total_clientes = clientesReais.size || 1;
+    const receita_total = Object.values(receitaPorCliente).reduce((s, v) => s + v, 0);
+
+    // ── Ticket médio por cliente (receita real período / clientes reais únicos) ──
     const ticket_medio_cliente = receita_total / total_clientes;
 
     // ── MRR (snapshot atual de assinaturas ativas) ──
@@ -2288,79 +2302,118 @@ app.get('/api/clientes/kpis', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// GET /api/clientes/todos — todos os clientes Stripe com totais e status NF
+// Identifica cobranças que são recargas automáticas de subconta GHL — NÃO são clientes reais
+const _isAutoRecharge = ch => /auto-recharge|sub-account/i.test(ch.description || '');
+
+// GET /api/clientes/todos — clientes classificados: ativo | sem_assinatura | variavel
+// tipo_cliente:
+//   'ativo'          → tem assinatura ativa no Stripe
+//   'sem_assinatura' → tem cobranças reais mas sem sub ativa (futuro cliente / lapsado)
+//   'variavel'       → cobranças são apenas auto-recharge/GHL (não é cliente real)
+// Por padrão filtra fora 'variavel'. Passar ?incluir_variaveis=true para ver tudo.
 app.get('/api/clientes/todos', async (req, res) => {
   try {
     const { inicio, fim } = getPeriodo(req);
+    const incluirVariaveis = req.query.incluir_variaveis === 'true';
 
-    // Busca charges do período + todos os customers em paralelo
-    const [charges, allCustomers] = await Promise.all([
+    // Busca em paralelo: charges do período, assinaturas ativas, customers
+    const [charges, activeSubs, allCustomers] = await Promise.all([
       stripeListAll('charges', {
         'created[gte]': String(inicio),
         'created[lte]': String(fim),
       }),
+      stripeListAll('subscriptions', { status: 'active' }),
       stripeListAll('customers', {}),
     ]);
 
-    // Mapa de customer id → nome/email
+    // IDs de customers com assinatura ativa
+    const ativoSubIds = new Set(activeSubs.map(s => s.customer).filter(Boolean));
+
+    // Mapa customer id → nome/email
     const custMap = {};
     for (const c of allCustomers) {
       custMap[c.id] = { nome: c.name || '', email: c.email || '', created: c.created };
     }
 
-    // Agrupa cobranças por cliente
+    // Agrupa cobranças por cliente, separando real vs auto-recharge
     const porCliente = {};
     for (const ch of charges.filter(c => c.status === 'succeeded')) {
       const cid = ch.customer || ch.billing_details?.email || 'sem-id';
       const custInfo = custMap[cid] || {};
       const email = custInfo.email || ch.billing_details?.email || '';
       const nome = custInfo.nome || ch.billing_details?.name || email || 'N/A';
-      const key = cid;
 
-      if (!porCliente[key]) {
-        porCliente[key] = {
-          id: cid,
-          nome,
-          email,
-          total: 0,
-          count: 0,
+      if (!porCliente[cid]) {
+        porCliente[cid] = {
+          id: cid, nome, email,
+          total: 0, count: 0,
+          total_variavel: 0, count_variavel: 0,
+          tem_cobranca_real: false,
           primeira_cobranca: ch.created,
           ultima_cobranca: ch.created,
           customer_criado: custInfo.created || null,
         };
       }
-      porCliente[key].total += (ch.amount || 0) / 100;
-      porCliente[key].count += 1;
-      if (ch.created < porCliente[key].primeira_cobranca) porCliente[key].primeira_cobranca = ch.created;
-      if (ch.created > porCliente[key].ultima_cobranca) porCliente[key].ultima_cobranca = ch.created;
+      const valor = (ch.amount || 0) / 100;
+      if (_isAutoRecharge(ch)) {
+        porCliente[cid].total_variavel += valor;
+        porCliente[cid].count_variavel += 1;
+      } else {
+        porCliente[cid].total += valor;
+        porCliente[cid].count += 1;
+        porCliente[cid].tem_cobranca_real = true;
+      }
+      if (ch.created < porCliente[cid].primeira_cobranca) porCliente[cid].primeira_cobranca = ch.created;
+      if (ch.created > porCliente[cid].ultima_cobranca) porCliente[cid].ultima_cobranca = ch.created;
     }
 
     // Cross-reference NF emitida por nome (fuzzy)
     const nfOk = nfHistorico.filter(n => n.status === 'ok');
+
     const clientes = Object.values(porCliente).map(cl => {
+      // Classificação
+      let tipo_cliente;
+      if (ativoSubIds.has(cl.id)) {
+        tipo_cliente = 'ativo';
+      } else if (cl.tem_cobranca_real) {
+        tipo_cliente = 'sem_assinatura'; // futuro cliente ou lapsado
+      } else {
+        tipo_cliente = 'variavel'; // apenas auto-recharge GHL — não é cliente
+      }
+
+      // NF emitida
       const nomeNorm = normStr(cl.nome);
       const nf = nfOk.find(n => {
         const nfNorm = normStr(n.nome_razao_social);
         const words = nfNorm.split(/\s+/).filter(w => w.length > 3);
         if (words.length === 0) return false;
-        const matched = words.filter(w => nomeNorm.includes(w)).length;
-        return matched / words.length >= 0.5;
+        return words.filter(w => nomeNorm.includes(w)).length / words.length >= 0.5;
       });
+
       return {
-        ...cl,
+        id: cl.id,
+        nome: cl.nome,
+        email: cl.email,
+        tipo_cliente,
         total: parseFloat(cl.total.toFixed(2)),
+        count: cl.count,
         nf_emitida: !!nf,
         nf_numero: nf?.numero_nf || null,
         nf_data: nf?.data_emissao || null,
-        primeira_cobranca_fmt: new Date(cl.primeira_cobranca * 1000).toLocaleDateString('pt-BR'),
         ultima_cobranca_fmt: new Date(cl.ultima_cobranca * 1000).toLocaleDateString('pt-BR'),
       };
     });
 
-    // Ordena por total desc
-    clientes.sort((a, b) => b.total - a.total);
+    // Filtra: por padrão exclui 'variavel' (auto-recharge GHL, não são clientes)
+    const filtrados = clientes.filter(cl => incluirVariaveis || cl.tipo_cliente !== 'variavel');
+    filtrados.sort((a, b) => b.total - a.total);
 
-    res.json({ total: clientes.length, clientes });
+    res.json({
+      total: filtrados.length,
+      total_ativos: filtrados.filter(c => c.tipo_cliente === 'ativo').length,
+      total_sem_assinatura: filtrados.filter(c => c.tipo_cliente === 'sem_assinatura').length,
+      clientes: filtrados,
+    });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
