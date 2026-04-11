@@ -2372,7 +2372,7 @@ app.get('/api/clientes/kpis', async (req, res) => {
     const valor_medio_mensal = mrr / contas_ativas;
 
     // ── Clientes implementação — fonte: PagBank (não Stripe) ──────────────────────
-    const { inicio: inicioPBkpi, fim: fimPBkpi } = getPeriodoPagbank(req);
+    const _nowKpi = new Date(new Date().getTime() - 3*3600000); const fimPBkpi = _nowKpi.toISOString().slice(0,10); const _90dKpi = new Date(_nowKpi.getTime() - 90*24*3600000); const inicioPBkpi = _90dKpi.toISOString().slice(0,10);
     const txsPBkpi = await pagbankListAllTx(inicioPBkpi, fimPBkpi);
     const refMapKpi = {};
     txsPBkpi.forEach(tx => { if (tx.referencia && !refMapKpi[tx.referencia]) refMapKpi[tx.referencia] = tx.id; });
@@ -2520,7 +2520,7 @@ app.get('/api/clientes/todos', async (req, res) => {
     }
 
     // ── PagBank: implementações do período → adiciona clientes ao mapa ──────────
-    const { inicio: inicioPBtodos, fim: fimPBtodos } = getPeriodoPagbank(req);
+    const _nowTodos = new Date(new Date().getTime() - 3*3600000); const fimPBtodos = _nowTodos.toISOString().slice(0,10); const _90dTodos = new Date(_nowTodos.getTime() - 90*24*3600000); const inicioPBtodos = _90dTodos.toISOString().slice(0,10);
     const txsPBtodos = await pagbankListAllTx(inicioPBtodos, fimPBtodos);
     const refMapTodos = {};
     txsPBtodos.forEach(tx => { if (tx.referencia && !refMapTodos[tx.referencia]) refMapTodos[tx.referencia] = tx.id; });
