@@ -1,6 +1,8 @@
 const express = require('express');
 const cors = require('cors');
 const https = require('https');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();const PORT = process.env.PORT || 3001;
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
@@ -1551,7 +1553,6 @@ app.get('/api/ghl/cruzamento', async (req, res) => {
 // quando o match automatico por nome nao funciona
 // ============================================================
 
-const fs = require('fs');
 const MAPPINGS_FILE = '/tmp/ghl_stripe_mappings.json';
 
 // Carrega mapeamentos do arquivo (persiste entre restarts)
@@ -2002,9 +2003,35 @@ app.get('/api/stripe/ltv', async (req, res) => {
 // NF AUTOMÁTICA — integração Contabilizei → GHL via email
 // ═══════════════════════════════════════════════════════════
 
-// Historico NF em memória — indexado por mes_ano ("2026-04") + array geral
-const nfHistorico = [];           // todos os registros (compat. retroativa)
-const nfPorMes    = {};           // { "2026-04": [...] }
+// Historico NF — persistido em JSON para sobreviver restarts/deploys
+const NF_DATA_FILE = path.join(__dirname, 'nf-data.json');
+let nfHistorico = [];             // todos os registros (compat. retroativa)
+let nfPorMes    = {};             // { "2026-04": [...] }
+
+function loadNfData() {
+  try {
+    if (fs.existsSync(NF_DATA_FILE)) {
+      const raw = fs.readFileSync(NF_DATA_FILE, 'utf8');
+      const data = JSON.parse(raw);
+      nfHistorico = data.historico || [];
+      nfPorMes = data.porMes || {};
+      console.log(`[NF] Carregados ${nfHistorico.length} registros de ${NF_DATA_FILE}`);
+    }
+  } catch (e) {
+    console.error('[NF] Erro ao carregar nf-data.json:', e.message);
+  }
+}
+
+function saveNfData() {
+  try {
+    fs.writeFileSync(NF_DATA_FILE, JSON.stringify({ historico: nfHistorico, porMes: nfPorMes }), 'utf8');
+  } catch (e) {
+    console.error('[NF] Erro ao salvar nf-data.json:', e.message);
+  }
+}
+
+// Carregar dados de NF ao iniciar o servidor
+loadNfData();
 
 function mesAnoAtual() {
   const d = new Date();
@@ -2023,6 +2050,7 @@ function addNfEntry(entry) {
   );
   if (idx >= 0) nfPorMes[ma][idx] = entry;
   else nfPorMes[ma].unshift(entry);
+  saveNfData();
 }
 
 // Normaliza string para busca fuzzy: remove acentos, lowercase, trim
@@ -2265,7 +2293,30 @@ app.delete('/api/nf/remover-manual', (req, res) => {
   });
   nfHistorico.length = 0;
   filtrados.forEach(e => nfHistorico.push(e));
+  saveNfData();
   res.json({ sucesso: true, removidos: antes - nfHistorico.length });
+});
+
+// POST /api/nf/importar — bulk import de NF entries (para re-popular após deploy)
+app.post('/api/nf/importar', (req, res) => {
+  const { entries } = req.body;
+  if (!Array.isArray(entries) || entries.length === 0) {
+    return res.status(400).json({ error: 'body.entries deve ser um array não vazio' });
+  }
+  let added = 0;
+  for (const entry of entries) {
+    if (!entry.nome_razao_social && !entry.email_cliente) continue;
+    entry.ts = entry.ts || new Date().toISOString();
+    entry.status = entry.status || 'ok';
+    addNfEntry(entry);
+    added++;
+  }
+  res.json({ sucesso: true, importados: added, total: nfHistorico.length });
+});
+
+// GET /api/nf/exportar — exporta todos os dados de NF (para backup)
+app.get('/api/nf/exportar', (req, res) => {
+  res.json({ historico: nfHistorico, porMes: nfPorMes, total: nfHistorico.length });
 });
 
 // GET /api/nf/testar-match — testa qual subconta bate com um nome/CNPJ sem gravar
