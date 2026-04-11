@@ -2374,9 +2374,6 @@ app.get('/api/clientes/kpis', async (req, res) => {
     // ── Clientes implementação — fonte: PagBank (não Stripe) ──────────────────────
     const _nowKpi = new Date(new Date().getTime() - 3*3600000); const fimPBkpi = _nowKpi.toISOString().slice(0,10); const _90dKpi = new Date(_nowKpi.getTime() - 90*24*3600000); const inicioPBkpi = _90dKpi.toISOString().slice(0,10);
     const txsPBkpi = await pagbankListAllTx(inicioPBkpi, fimPBkpi);
-    const refMapKpi = {};
-    txsPBkpi.forEach(tx => { if (tx.referencia && !refMapKpi[tx.referencia]) refMapKpi[tx.referencia] = tx.id; });
-    await Promise.all(Object.entries(refMapKpi).map(([ref, code]) => fetchLinkNome(ref, code)));
 
     const emailsComSubKpi = new Set();
     for (const sub of activeSubs) {
@@ -2388,11 +2385,9 @@ app.get('/api/clientes/kpis', async (req, res) => {
     const implEmailsSet = new Set();
     for (const tx of txsPBkpi) {
       if (!['pago', 'disponivel'].includes(tx.status)) continue;
-      const descricao = linkNomeCache[tx.referencia] || tx.link_pagamento || '';
-      const tipo = classifyTipo(descricao, tx.bruto, tx.metodo, 'pagbank');
+      const tipo = classifyTipo('', tx.bruto, tx.metodo, 'pagbank');
       if (!IMPL_TIPOS_KPI.includes(tipo)) continue;
-      const sender = senderCache[tx.id] || {};
-      const key = (sender.email || tx.email || tx.id || '').toLowerCase();
+      const key = (tx.email || tx.id || '').toLowerCase();
       implEmailsSet.add(key);
     }
     const soImpl = [...implEmailsSet].filter(e => !emailsComSubKpi.has(e));
