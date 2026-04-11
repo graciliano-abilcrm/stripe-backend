@@ -2183,6 +2183,57 @@ app.get('/api/nf/historico', (req, res) => {
   res.json({ total: nfHistorico.length, historico: nfHistorico.slice(0, limit) });
 });
 
+// POST /api/nf/marcar-manual — dá baixa manual na NF de um cliente
+// Body: { nome, email, numero_nf?, observacao? }
+app.post('/api/nf/marcar-manual', (req, res) => {
+  const { nome, email, numero_nf, observacao } = req.body;
+  if (!nome && !email) return res.status(400).json({ error: 'nome ou email obrigatorio' });
+
+  // Evita duplicata: se já existe entrada manual/ok para esse cliente, atualiza
+  const nomeNorm = normStr(nome || '');
+  const idx = nfHistorico.findIndex(n => {
+    if (n.origem !== 'manual') return false;
+    return normStr(n.nome_razao_social) === nomeNorm || (email && n.email_cliente === email);
+  });
+
+  const entry = {
+    ts: new Date().toISOString(),
+    status: 'ok',
+    origem: 'manual',
+    nome_razao_social: nome || email,
+    email_cliente: email || null,
+    numero_nf: numero_nf || null,
+    observacao: observacao || null,
+  };
+
+  if (idx >= 0) {
+    nfHistorico[idx] = entry; // atualiza existente
+  } else {
+    nfHistorico.unshift(entry);
+    if (nfHistorico.length > 200) nfHistorico.pop();
+  }
+
+  res.json({ sucesso: true, ...entry });
+});
+
+// DELETE /api/nf/remover-manual — desfaz baixa manual de um cliente
+// Body: { nome?, email? }
+app.delete('/api/nf/remover-manual', (req, res) => {
+  const { nome, email } = req.body;
+  if (!nome && !email) return res.status(400).json({ error: 'nome ou email obrigatorio' });
+  const nomeNorm = normStr(nome || '');
+  const antes = nfHistorico.length;
+  const filtrados = nfHistorico.filter(n => {
+    if (n.origem !== 'manual') return true; // nunca remove entradas automáticas
+    const matchNome = nome && normStr(n.nome_razao_social) === nomeNorm;
+    const matchEmail = email && n.email_cliente === email;
+    return !(matchNome || matchEmail);
+  });
+  nfHistorico.length = 0;
+  filtrados.forEach(e => nfHistorico.push(e));
+  res.json({ sucesso: true, removidos: antes - nfHistorico.length });
+});
+
 // GET /api/nf/testar-match — testa qual subconta bate com um nome/CNPJ sem gravar
 app.get('/api/nf/testar-match', async (req, res) => {
   try {
