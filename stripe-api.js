@@ -2204,8 +2204,89 @@ app.get('/api/nf/testar-match', async (req, res) => {
 });
 
 // ============================================================
-// CLIENTES — lista completa + métricas
+// CLIENTES — KPIs, lista completa + métricas de dias
 // ============================================================
+
+// GET /api/clientes/kpis — 5 métricas: total clientes, ticket médio/cliente, MRR, LTV, valor médio mensal
+app.get('/api/clientes/kpis', async (req, res) => {
+  try {
+    const { inicio, fim } = getPeriodo(req);
+
+    // Busca em paralelo: charges do período, assinaturas ativas, todos os customers
+    const [charges, activeSubs, allCustomers] = await Promise.all([
+      stripeListAll('charges', {
+        'created[gte]': String(inicio),
+        'created[lte]': String(fim),
+      }),
+      stripeListAll('subscriptions', { status: 'active' }),
+      stripeListAll('customers', {}),
+    ]);
+
+    const succeeded = charges.filter(c => c.status === 'succeeded');
+
+    // ── Total clientes únicos com pagamento no período ──
+    const clientesSet = new Set();
+    let receita_total = 0;
+    for (const ch of succeeded) {
+      const cid = ch.customer || ch.billing_details?.email || ch.id;
+      clientesSet.add(cid);
+      receita_total += (ch.amount || 0) / 100;
+    }
+    const total_clientes = clientesSet.size || 1;
+
+    // ── Ticket médio por cliente (receita período / clientes únicos) ──
+    const ticket_medio_cliente = receita_total / total_clientes;
+
+    // ── MRR (snapshot atual de assinaturas ativas) ──
+    let mrr = 0;
+    const clientesSub = new Set();
+    for (const sub of activeSubs) {
+      if (sub.customer) clientesSub.add(sub.customer);
+      for (const item of (sub.items?.data || [])) {
+        const price = item.price;
+        if (!price?.recurring) continue;
+        let valor = (price.unit_amount || 0) / 100;
+        const interval = price.recurring.interval;
+        const cnt = price.recurring.interval_count || 1;
+        if (interval === 'year') valor = (valor / 12) / cnt;
+        else if (interval === 'week') valor = (valor * 4.33) / cnt;
+        else valor = valor / cnt;
+        mrr += valor * (item.quantity || 1);
+      }
+    }
+
+    // ── LTV: ticket_medio_cliente × meses médios de vida do cliente ──
+    const agora = Math.floor(Date.now() / 1000);
+    let soma_meses = 0;
+    let count_cust = 0;
+    for (const c of allCustomers) {
+      if (c.created) {
+        soma_meses += (agora - c.created) / (30 * 24 * 3600);
+        count_cust++;
+      }
+    }
+    const avg_meses_vida = count_cust > 0 ? soma_meses / count_cust : 12;
+    const ltv = ticket_medio_cliente * avg_meses_vida;
+
+    // ── Valor médio mensal por cliente ativo (MRR / contas com sub ativa) ──
+    const contas_ativas = clientesSub.size || 1;
+    const valor_medio_mensal = mrr / contas_ativas;
+
+    const r = v => parseFloat((v || 0).toFixed(2));
+    res.json({
+      total_clientes,
+      ticket_medio_cliente: r(ticket_medio_cliente),
+      mrr: r(mrr),
+      ltv: r(ltv),
+      valor_medio_mensal: r(valor_medio_mensal),
+      _meta: {
+        receita_total: r(receita_total),
+        avg_meses_vida: r(avg_meses_vida),
+        contas_ativas,
+      }
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
 
 // GET /api/clientes/todos — todos os clientes Stripe com totais e status NF
 app.get('/api/clientes/todos', async (req, res) => {
