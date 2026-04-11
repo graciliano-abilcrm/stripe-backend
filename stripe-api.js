@@ -2617,12 +2617,18 @@ app.get('/api/clientes/todos', async (req, res) => {
     }
 
     const clientes = Object.values(porCliente).map(cl => {
-      // Classificação: ativo (sub Stripe) > implementacao (PagBank) > variavel
+      // Flags independentes: um cliente pode ter assinatura E implementação ao mesmo tempo
+      const tem_assinatura = ativoSubIds.has(cl.id);
+      const tem_implementacao = !!cl.tem_impl_pagbank;
+
+      // tipo_cliente primário para ordenação/display
       let tipo_cliente;
-      if (ativoSubIds.has(cl.id)) {
+      if (tem_assinatura && tem_implementacao) {
+        tipo_cliente = 'ativo'; // primário é ativo, mas tem_implementacao = true
+      } else if (tem_assinatura) {
         tipo_cliente = 'ativo';
-      } else if (cl.tem_impl_pagbank) {
-        tipo_cliente = 'implementacao'; // pagou impl PagBank, aguardando ativação sub Stripe
+      } else if (tem_implementacao) {
+        tipo_cliente = 'implementacao';
       } else {
         tipo_cliente = 'variavel';
       }
@@ -2634,6 +2640,8 @@ app.get('/api/clientes/todos', async (req, res) => {
         nome: cl.nome,
         email: cl.email,
         tipo_cliente,
+        tem_assinatura,
+        tem_implementacao,
         total: parseFloat(cl.total.toFixed(2)),
         count: cl.count,
         nf_emitida: !!nf,
@@ -2647,7 +2655,6 @@ app.get('/api/clientes/todos', async (req, res) => {
     // Filtra: por padrão exclui 'variavel'
     const filtrados = clientes.filter(cl => incluirVariaveis || cl.tipo_cliente !== 'variavel');
     filtrados.sort((a, b) => {
-      // ativos primeiro, depois implementacao, depois por valor
       const order = { ativo: 0, implementacao: 1, variavel: 2 };
       const od = (order[a.tipo_cliente] || 0) - (order[b.tipo_cliente] || 0);
       return od !== 0 ? od : b.total - a.total;
@@ -2655,8 +2662,8 @@ app.get('/api/clientes/todos', async (req, res) => {
 
     res.json({
       total: filtrados.length,
-      total_ativos: filtrados.filter(c => c.tipo_cliente === 'ativo').length,
-      total_implementacao: filtrados.filter(c => c.tipo_cliente === 'implementacao').length,
+      total_ativos: filtrados.filter(c => c.tem_assinatura).length,
+      total_implementacao: filtrados.filter(c => c.tem_implementacao).length,
       mes,
       clientes: filtrados,
     });
