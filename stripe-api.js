@@ -2426,6 +2426,11 @@ app.get('/api/clientes/kpis', async (req, res) => {
     const { inicio: inicioPBkpi, fim: fimPBkpi } = getPeriodoPagbank(req);
     const txsPBkpi = await pagbankListAllTx(inicioPBkpi, fimPBkpi);
 
+    // Buscar nomes/emails reais via fetchLinkNome (necessário para deduplicação correta)
+    const refMapKpi = {};
+    txsPBkpi.forEach(tx => { if (tx.referencia && !refMapKpi[tx.referencia]) refMapKpi[tx.referencia] = tx.id; });
+    await Promise.all(Object.entries(refMapKpi).map(([ref, code]) => fetchLinkNome(ref, code)));
+
     const emailsComSubKpi = new Set();
     for (const sub of activeSubs) {
       const cust = allCustomers.find(c => c.id === sub.customer);
@@ -2436,9 +2441,12 @@ app.get('/api/clientes/kpis', async (req, res) => {
     const implEmailsSet = new Set();
     for (const tx of txsPBkpi) {
       if (!['pago', 'disponivel'].includes(tx.status)) continue;
-      const tipo = classifyTipo('', tx.bruto, tx.metodo, 'pagbank');
+      const descricao = linkNomeCache[tx.referencia] || tx.link_pagamento || '';
+      const tipo = classifyTipo(descricao, tx.bruto, tx.metodo, 'pagbank');
       if (!IMPL_TIPOS_KPI.includes(tipo)) continue;
-      const key = (tx.email || tx.id || '').toLowerCase();
+      const sender = senderCache[tx.id] || {};
+      const email = (sender.email || tx.email || '').toLowerCase();
+      const key = (email && email !== 'n/a') ? email : tx.id;
       implEmailsSet.add(key);
     }
     const soImpl = [...implEmailsSet].filter(e => !emailsComSubKpi.has(e));
@@ -2584,7 +2592,8 @@ app.get('/api/clientes/todos', async (req, res) => {
       if (!IMPL_TIPOS_TODOS.includes(tipo)) continue;
 
       const sender = senderCache[tx.id] || {};
-      const email  = (sender.email || tx.email || '').toLowerCase();
+      const rawEmail = (sender.email || tx.email || '').toLowerCase();
+      const email  = (rawEmail && rawEmail !== 'n/a') ? rawEmail : '';
       const nome   = sender.nome || tx.nome || email || 'N/A';
       const valor  = tx.liquido || tx.bruto;
       const stripeId = email ? emailToStripeId[email] : null;
