@@ -2407,8 +2407,7 @@ app.get('/api/clientes/kpis', async (req, res) => {
       _meta: {
         receita_total: r(receita_total),
         avg_meses_vida: r(avg_meses_vida),
-        contas_ativas,,
-      _debug_pb: { tx_count: txsPBkpi.length, impl_size: implEmailsSet.size, soImpl: soImpl.length, inicio: inicioPBkpi, fim: fimPBkpi }
+        contas_ativas,
       }
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
