@@ -2371,16 +2371,32 @@ app.get('/api/clientes/kpis', async (req, res) => {
     const contas_ativas = clientesSub.size || 1;
     const valor_medio_mensal = mrr / contas_ativas;
 
-    // ── Clientes implementação (Stripe sem sub ativa, com cobrança real no período) ──
-    const implClientes = new Set();
-    for (const ch of succeeded) {
-      const cid = ch.customer || ch.billing_details?.email || ch.id;
-      if (!_isAutoRecharge(ch) && !ativoSubIdsKpi.has(cid)) {
-        implClientes.add(cid);
-      }
+    // ── Clientes implementação — fonte: PagBank (não Stripe) ──────────────────────
+    const { inicio: inicioPBkpi, fim: fimPBkpi } = getPeriodoPagbank(req);
+    const txsPBkpi = await pagbankListAllTx(inicioPBkpi, fimPBkpi);
+    const refMapKpi = {};
+    txsPBkpi.forEach(tx => { if (tx.referencia && !refMapKpi[tx.referencia]) refMapKpi[tx.referencia] = tx.id; });
+    await Promise.all(Object.entries(refMapKpi).map(([ref, code]) => fetchLinkNome(ref, code)));
+
+    const emailsComSubKpi = new Set();
+    for (const sub of activeSubs) {
+      const cust = allCustomers.find(c => c.id === sub.customer);
+      if (cust?.email) emailsComSubKpi.add(cust.email.toLowerCase());
     }
-    const total_implementacao = implClientes.size;
-    // total_ativos = assinaturas ativas (fonte de verdade), não charges do período
+
+    const IMPL_TIPOS_KPI = ['implementacao_basica', 'implementacao_personalizada', 'implementacao_avancada', 'implementacao'];
+    const implEmailsSet = new Set();
+    for (const tx of txsPBkpi) {
+      if (!['pago', 'disponivel'].includes(tx.status)) continue;
+      const descricao = linkNomeCache[tx.referencia] || tx.link_pagamento || '';
+      const tipo = classifyTipo(descricao, tx.bruto, tx.metodo, 'pagbank');
+      if (!IMPL_TIPOS_KPI.includes(tipo)) continue;
+      const sender = senderCache[tx.id] || {};
+      const key = (sender.email || tx.email || tx.id || '').toLowerCase();
+      implEmailsSet.add(key);
+    }
+    const soImpl = [...implEmailsSet].filter(e => !emailsComSubKpi.has(e));
+    const total_implementacao = soImpl.length;
     const total_ativos = activeSubs.length;
     const total_clientes_todos = total_ativos + total_implementacao;
 
@@ -2503,13 +2519,55 @@ app.get('/api/clientes/todos', async (req, res) => {
       });
     }
 
+    // ── PagBank: implementações do período → adiciona clientes ao mapa ──────────
+    const { inicio: inicioPBtodos, fim: fimPBtodos } = getPeriodoPagbank(req);
+    const txsPBtodos = await pagbankListAllTx(inicioPBtodos, fimPBtodos);
+    const refMapTodos = {};
+    txsPBtodos.forEach(tx => { if (tx.referencia && !refMapTodos[tx.referencia]) refMapTodos[tx.referencia] = tx.id; });
+    await Promise.all(Object.entries(refMapTodos).map(([ref, code]) => fetchLinkNome(ref, code)));
+
+    const emailToStripeId = {};
+    for (const c of allCustomers) { if (c.email) emailToStripeId[c.email.toLowerCase()] = c.id; }
+
+    const IMPL_TIPOS_TODOS = ['implementacao_basica', 'implementacao_personalizada', 'implementacao_avancada', 'implementacao'];
+
+    for (const tx of txsPBtodos) {
+      if (!['pago', 'disponivel'].includes(tx.status)) continue;
+      const descricao = linkNomeCache[tx.referencia] || tx.link_pagamento || '';
+      const tipo = classifyTipo(descricao, tx.bruto, tx.metodo, 'pagbank');
+      if (!IMPL_TIPOS_TODOS.includes(tipo)) continue;
+
+      const sender = senderCache[tx.id] || {};
+      const email  = (sender.email || tx.email || '').toLowerCase();
+      const nome   = sender.nome || tx.nome || email || 'N/A';
+      const valor  = tx.liquido || tx.bruto;
+      const stripeId = email ? emailToStripeId[email] : null;
+      const key = stripeId || ('pb_' + (email || tx.id));
+
+      if (!porCliente[key]) {
+        porCliente[key] = {
+          id: key, nome, email,
+          total: 0, count: 0,
+          total_variavel: 0, count_variavel: 0,
+          tem_cobranca_real: false,
+          tem_impl_pagbank: false,
+          primeira_cobranca: new Date(tx.data + 'T00:00:00').getTime() / 1000,
+          ultima_cobranca:   new Date(tx.data + 'T00:00:00').getTime() / 1000,
+          customer_criado: null,
+        };
+      }
+      porCliente[key].tem_impl_pagbank = true;
+      porCliente[key].total += valor;
+      porCliente[key].count += 1;
+    }
+
     const clientes = Object.values(porCliente).map(cl => {
-      // Classificação
+      // Classificação: ativo (sub Stripe) > implementacao (PagBank) > variavel
       let tipo_cliente;
       if (ativoSubIds.has(cl.id)) {
         tipo_cliente = 'ativo';
-      } else if (cl.tem_cobranca_real) {
-        tipo_cliente = 'implementacao'; // cobrança real mas sem sub → implementação paga aguardando sub
+      } else if (cl.tem_impl_pagbank) {
+        tipo_cliente = 'implementacao'; // pagou impl PagBank, aguardando ativação sub Stripe
       } else {
         tipo_cliente = 'variavel';
       }
