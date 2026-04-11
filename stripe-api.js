@@ -2372,7 +2372,7 @@ app.get('/api/clientes/kpis', async (req, res) => {
     const valor_medio_mensal = mrr / contas_ativas;
 
     // ── Clientes implementação — fonte: PagBank (não Stripe) ──────────────────────
-    const inicioPBkpi = '2024-01-01'; const _nowBRkpi = new Date(new Date().getTime() - 3*3600000); const fimPBkpi = _nowBRkpi.toISOString().slice(0,10);
+    const { inicio: inicioPBkpi, fim: fimPBkpi } = getPeriodoPagbank(req);
     const txsPBkpi = await pagbankListAllTx(inicioPBkpi, fimPBkpi);
     const refMapKpi = {};
     txsPBkpi.forEach(tx => { if (tx.referencia && !refMapKpi[tx.referencia]) refMapKpi[tx.referencia] = tx.id; });
@@ -2396,9 +2396,9 @@ app.get('/api/clientes/kpis', async (req, res) => {
       implEmailsSet.add(key);
     }
     const soImpl = [...implEmailsSet].filter(e => !emailsComSubKpi.has(e));
-    const total_implementacao = soImpl.length;
+    const total_implementacao = implEmailsSet.size;
     const total_ativos = activeSubs.length;
-    const total_clientes_todos = total_ativos + total_implementacao;
+    const total_clientes_todos = total_ativos + soImpl.length;
 
     const r = v => parseFloat((v || 0).toFixed(2));
     res.json({
@@ -2520,7 +2520,7 @@ app.get('/api/clientes/todos', async (req, res) => {
     }
 
     // ── PagBank: implementações do período → adiciona clientes ao mapa ──────────
-    const inicioPBtodos = '2024-01-01'; const _nowBRtodos = new Date(new Date().getTime() - 3*3600000); const fimPBtodos = _nowBRtodos.toISOString().slice(0,10);
+    const { inicio: inicioPBtodos, fim: fimPBtodos } = getPeriodoPagbank(req);
     const txsPBtodos = await pagbankListAllTx(inicioPBtodos, fimPBtodos);
     const refMapTodos = {};
     txsPBtodos.forEach(tx => { if (tx.referencia && !refMapTodos[tx.referencia]) refMapTodos[tx.referencia] = tx.id; });
