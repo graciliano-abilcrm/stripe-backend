@@ -2372,7 +2372,7 @@ app.get('/api/clientes/kpis', async (req, res) => {
     const valor_medio_mensal = mrr / contas_ativas;
 
     // ── Clientes implementação — fonte: PagBank (não Stripe) ──────────────────────
-    const { inicio: inicioPBkpi, fim: fimPBkpi } = getPeriodoPagbank(req);
+    const inicioPBkpi = '2024-01-01'; const _nowBRkpi = new Date(new Date().getTime() - 3*3600000); const fimPBkpi = _nowBRkpi.toISOString().slice(0,10);
     const txsPBkpi = await pagbankListAllTx(inicioPBkpi, fimPBkpi);
     const refMapKpi = {};
     txsPBkpi.forEach(tx => { if (tx.referencia && !refMapKpi[tx.referencia]) refMapKpi[tx.referencia] = tx.id; });
@@ -2520,7 +2520,7 @@ app.get('/api/clientes/todos', async (req, res) => {
     }
 
     // ── PagBank: implementações do período → adiciona clientes ao mapa ──────────
-    const { inicio: inicioPBtodos, fim: fimPBtodos } = getPeriodoPagbank(req);
+    const inicioPBtodos = '2024-01-01'; const _nowBRtodos = new Date(new Date().getTime() - 3*3600000); const fimPBtodos = _nowBRtodos.toISOString().slice(0,10);
     const txsPBtodos = await pagbankListAllTx(inicioPBtodos, fimPBtodos);
     const refMapTodos = {};
     txsPBtodos.forEach(tx => { if (tx.referencia && !refMapTodos[tx.referencia]) refMapTodos[tx.referencia] = tx.id; });
