@@ -2203,6 +2203,150 @@ app.get('/api/nf/testar-match', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ============================================================
+// CLIENTES — lista completa + métricas
+// ============================================================
+
+// GET /api/clientes/todos — todos os clientes Stripe com totais e status NF
+app.get('/api/clientes/todos', async (req, res) => {
+  try {
+    const { inicio, fim } = getPeriodo(req);
+
+    // Busca charges do período + todos os customers em paralelo
+    const [charges, allCustomers] = await Promise.all([
+      stripeListAll('charges', {
+        'created[gte]': String(inicio),
+        'created[lte]': String(fim),
+      }),
+      stripeListAll('customers', {}),
+    ]);
+
+    // Mapa de customer id → nome/email
+    const custMap = {};
+    for (const c of allCustomers) {
+      custMap[c.id] = { nome: c.name || '', email: c.email || '', created: c.created };
+    }
+
+    // Agrupa cobranças por cliente
+    const porCliente = {};
+    for (const ch of charges.filter(c => c.status === 'succeeded')) {
+      const cid = ch.customer || ch.billing_details?.email || 'sem-id';
+      const custInfo = custMap[cid] || {};
+      const email = custInfo.email || ch.billing_details?.email || '';
+      const nome = custInfo.nome || ch.billing_details?.name || email || 'N/A';
+      const key = cid;
+
+      if (!porCliente[key]) {
+        porCliente[key] = {
+          id: cid,
+          nome,
+          email,
+          total: 0,
+          count: 0,
+          primeira_cobranca: ch.created,
+          ultima_cobranca: ch.created,
+          customer_criado: custInfo.created || null,
+        };
+      }
+      porCliente[key].total += (ch.amount || 0) / 100;
+      porCliente[key].count += 1;
+      if (ch.created < porCliente[key].primeira_cobranca) porCliente[key].primeira_cobranca = ch.created;
+      if (ch.created > porCliente[key].ultima_cobranca) porCliente[key].ultima_cobranca = ch.created;
+    }
+
+    // Cross-reference NF emitida por nome (fuzzy)
+    const nfOk = nfHistorico.filter(n => n.status === 'ok');
+    const clientes = Object.values(porCliente).map(cl => {
+      const nomeNorm = normStr(cl.nome);
+      const nf = nfOk.find(n => {
+        const nfNorm = normStr(n.nome_razao_social);
+        const words = nfNorm.split(/\s+/).filter(w => w.length > 3);
+        if (words.length === 0) return false;
+        const matched = words.filter(w => nomeNorm.includes(w)).length;
+        return matched / words.length >= 0.5;
+      });
+      return {
+        ...cl,
+        total: parseFloat(cl.total.toFixed(2)),
+        nf_emitida: !!nf,
+        nf_numero: nf?.numero_nf || null,
+        nf_data: nf?.data_emissao || null,
+        primeira_cobranca_fmt: new Date(cl.primeira_cobranca * 1000).toLocaleDateString('pt-BR'),
+        ultima_cobranca_fmt: new Date(cl.ultima_cobranca * 1000).toLocaleDateString('pt-BR'),
+      };
+    });
+
+    // Ordena por total desc
+    clientes.sort((a, b) => b.total - a.total);
+
+    res.json({ total: clientes.length, clientes });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/clientes/metricas — dia e semana com mais pagamentos
+app.get('/api/clientes/metricas', async (req, res) => {
+  try {
+    const { inicio, fim } = getPeriodo(req);
+
+    const charges = await stripeListAll('charges', {
+      'created[gte]': String(inicio),
+      'created[lte]': String(fim),
+    });
+    const succeeded = charges.filter(c => c.status === 'succeeded');
+
+    // Dia da semana (0=Dom ... 6=Sáb) em BRT (UTC-3)
+    const diasSemana = ['Domingo', 'Segunda', 'Terça', 'Quarta', 'Quinta', 'Sexta', 'Sábado'];
+    const contDia = Array(7).fill(0);
+    const valorDia = Array(7).fill(0);
+
+    // Semana do mês (1-5)
+    const contSemana = {};
+    const valorSemana = {};
+
+    for (const ch of succeeded) {
+      const dt = new Date((ch.created - 3 * 3600) * 1000); // BRT offset
+      const dow = dt.getUTCDay();
+      contDia[dow]++;
+      valorDia[dow] += (ch.amount || 0) / 100;
+
+      const dom = dt.getUTCDate();
+      const semana = Math.ceil(dom / 7);
+      const sk = 'Semana ' + semana;
+      contSemana[sk] = (contSemana[sk] || 0) + 1;
+      valorSemana[sk] = (valorSemana[sk] || 0) + (ch.amount || 0) / 100;
+    }
+
+    // Dia com mais pagamentos
+    const maxDiaIdx = contDia.indexOf(Math.max(...contDia));
+    const diasData = diasSemana.map((nome, i) => ({
+      nome,
+      count: contDia[i],
+      valor: parseFloat(valorDia[i].toFixed(2)),
+    }));
+
+    // Semana com mais pagamentos
+    const semanasData = Object.keys(contSemana).map(sk => ({
+      nome: sk,
+      count: contSemana[sk],
+      valor: parseFloat((valorSemana[sk] || 0).toFixed(2)),
+    })).sort((a, b) => parseInt(a.nome.split(' ')[1]) - parseInt(b.nome.split(' ')[1]));
+
+    const maxSemana = semanasData.reduce((best, s) => s.count > (best?.count || 0) ? s : best, null);
+
+    res.json({
+      dia_mais_pagamentos: {
+        nome: diasSemana[maxDiaIdx],
+        count: contDia[maxDiaIdx],
+        valor: parseFloat(valorDia[maxDiaIdx].toFixed(2)),
+      },
+      semana_mais_pagamentos: maxSemana,
+      por_dia: diasData,
+      por_semana: semanasData,
+      total_charges: succeeded.length,
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.listen(PORT, () => {
   console.log(`Stripe API backend rodando na porta ${PORT}`);
 });
