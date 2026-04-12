@@ -2501,6 +2501,25 @@ app.get('/api/clientes/todos', async (req, res) => {
     // IDs de customers com assinatura ativa
     const ativoSubIds = new Set(activeSubs.map(s => s.customer).filter(Boolean));
 
+    // Mapa customer id → valor mensal da assinatura (MRR individual)
+    const subValorMap = {};
+    for (const sub of activeSubs) {
+      if (!sub.customer) continue;
+      let mrr = 0;
+      for (const item of (sub.items?.data || [])) {
+        const price = item.price;
+        if (!price?.recurring) continue;
+        let v = (price.unit_amount || 0) / 100;
+        const interval = price.recurring.interval;
+        const cnt = price.recurring.interval_count || 1;
+        if (interval === 'year') v = (v / 12) / cnt;
+        else if (interval === 'week') v = (v * 4.33) / cnt;
+        else v = v / cnt;
+        mrr += v * (item.quantity || 1);
+      }
+      subValorMap[sub.customer] = (subValorMap[sub.customer] || 0) + mrr;
+    }
+
     // Mapa customer id → nome/email
     const custMap = {};
     for (const c of allCustomers) {
@@ -2635,6 +2654,8 @@ app.get('/api/clientes/todos', async (req, res) => {
 
       const nf = nfMatch(cl.nome) || (cl.email ? nfMatch(cl.email) : null);
 
+      const valor_assinatura = parseFloat((subValorMap[cl.id] || 0).toFixed(2));
+
       return {
         id: cl.id,
         nome: cl.nome,
@@ -2643,6 +2664,7 @@ app.get('/api/clientes/todos', async (req, res) => {
         tem_assinatura,
         tem_implementacao,
         total: parseFloat(cl.total.toFixed(2)),
+        valor_assinatura,          // MRR mensal da sub Stripe (sempre disponível se ativo)
         count: cl.count,
         nf_emitida: !!nf,
         nf_numero: nf?.numero_nf || null,
