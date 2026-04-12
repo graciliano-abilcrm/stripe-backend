@@ -2815,20 +2815,32 @@ app.get('/api/clientes/:customerId/historico', async (req, res) => {
     const ticket_medio  = cobranças.length > 0
       ? parseFloat((total_pago / cobranças.length).toFixed(2)) : 0;
 
-    // Assinatura atual (mais recente ativa ou canceled)
-    const subAtiva = activeSubs.find(s => s.status === 'active') || null;
+    // Todas as assinaturas ativas (cliente pode ter mais de uma — plano principal + adicionais)
+    const subsAtivas = activeSubs.filter(s => s.status === 'active');
+    const subAtiva = subsAtivas[0] || null; // usada para dados de assinatura principal
     let mrr_atual = 0;
-    let plano_atual = null;
-    if (subAtiva) {
-      for (const item of (subAtiva.items?.data || [])) {
+    const planos_ativos = [];
+    let proximo_vencimento_ts = null;
+
+    for (const sub of subsAtivas) {
+      for (const item of (sub.items?.data || [])) {
         const price = item.price;
         if (!price?.recurring) continue;
         let v = (price.unit_amount || 0) / 100;
         if (price.recurring.interval === 'year') v /= 12;
+        else if (price.recurring.interval === 'week') v = (v * 4.33);
         mrr_atual += v * (item.quantity || 1);
-        plano_atual = price.nickname || price.id;
+        const nome_plano = price.nickname || price.id;
+        if (!planos_ativos.includes(nome_plano)) planos_ativos.push(nome_plano);
+      }
+      // Próximo vencimento = o mais próximo entre todas as subs ativas
+      if (sub.current_period_end) {
+        if (!proximo_vencimento_ts || sub.current_period_end < proximo_vencimento_ts) {
+          proximo_vencimento_ts = sub.current_period_end;
+        }
       }
     }
+    const plano_atual = planos_ativos.join(' + ') || null;
 
     // NFs emitidas para este cliente (busca em todo o histórico por email/nome)
     const nomeNorm = normStr(nome);
@@ -2863,10 +2875,24 @@ app.get('/api/clientes/:customerId/historico', async (req, res) => {
         id: subAtiva.id,
         status: subAtiva.status,
         inicio: new Date(subAtiva.created * 1000).toLocaleDateString('pt-BR'),
-        proximo_vencimento: subAtiva.current_period_end
-          ? new Date(subAtiva.current_period_end * 1000).toLocaleDateString('pt-BR') : null,
+        proximo_vencimento: proximo_vencimento_ts
+          ? new Date(proximo_vencimento_ts * 1000).toLocaleDateString('pt-BR') : null,
         plano: plano_atual,
         mrr: r(mrr_atual),
+        total_assinaturas: subsAtivas.length,
+        assinaturas: subsAtivas.map(s => ({
+          id: s.id,
+          plano: s.items?.data?.map(i => i.price?.nickname || i.price?.id).join(', ') || null,
+          proximo_vencimento: s.current_period_end
+            ? new Date(s.current_period_end * 1000).toLocaleDateString('pt-BR') : null,
+          mrr: r(s.items?.data?.reduce((acc, item) => {
+            const price = item.price;
+            if (!price?.recurring) return acc;
+            let v = (price.unit_amount || 0) / 100;
+            if (price.recurring.interval === 'year') v /= 12;
+            return acc + v * (item.quantity || 1);
+          }, 0)),
+        })),
       } : null,
       cobranças,
       notas_fiscais: nfsCliente.map(n => ({
