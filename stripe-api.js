@@ -3255,10 +3255,19 @@ app.post('/api/chat-financeiro', async (req, res) => {
     const { mensagem, historico = [], pagina_atual = null } = req.body || {};
     if (!mensagem || !mensagem.trim()) return res.status(400).json({ error: 'mensagem obrigatória' });
 
-    // Contexto: última análise gravada (não refaz chamada cara à API)
-    const ultimaAnalise  = analisesHistorico[0];
-    const dados          = ultimaAnalise?.dados_periodo || {};
-    const analise        = ultimaAnalise?.analise       || {};
+    // Contexto: última análise gravada — se não houver, coleta dados ao vivo (sem chamar Claude/IA)
+    let ultimaAnalise = analisesHistorico[0];
+    let dadosAoVivo   = null;
+    if (!ultimaAnalise) {
+      try {
+        dadosAoVivo = await coletarDadosFinanceiros();
+        console.log('[Chat] Sem análise em memória — usando dados coletados ao vivo');
+      } catch(e) {
+        console.error('[Chat] Falha ao coletar dados ao vivo:', e.message);
+      }
+    }
+    const dados   = ultimaAnalise?.dados_periodo || dadosAoVivo || {};
+    const analise = ultimaAnalise?.analise       || {};
     const stripe         = dados?.stripe  || {};
     const pagbank        = dados?.pagbank || {};
     const periodo        = dados?.periodo || {};
