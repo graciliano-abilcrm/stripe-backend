@@ -2979,6 +2979,48 @@ function callClaude(systemPrompt, userPrompt, maxTokens = 6000) {
   });
 }
 
+// ── callClaude multi-turn (suporta histórico de conversa) ────────────────────
+function callClaudeMulti(systemPrompt, messages, maxTokens = 3000) {
+  return new Promise((resolve, reject) => {
+    const apiKey = process.env.ANTHROPIC_API_KEY || '';
+    if (!apiKey) return reject(new Error('ANTHROPIC_API_KEY não configurada'));
+
+    const body = JSON.stringify({
+      model: 'claude-opus-4-5',
+      max_tokens: maxTokens,
+      system: systemPrompt,
+      messages,
+    });
+
+    const opts = {
+      hostname: 'api.anthropic.com',
+      path: '/v1/messages',
+      method: 'POST',
+      headers: {
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(body),
+      },
+    };
+
+    const req = https.request(opts, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          if (json.content?.[0]) resolve(json.content[0].text);
+          else reject(new Error('Claude error: ' + JSON.stringify(json).slice(0, 300)));
+        } catch(e) { reject(e); }
+      });
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
 // ── Coleta dados financeiros internamente ─────────────────────────────────────
 async function coletarDadosFinanceiros(inicioTs, fimTs) {
   const agora  = Math.floor(Date.now() / 1000);
@@ -3201,6 +3243,120 @@ app.post('/api/analise-financeira/feedback', (req, res) => {
   }
   saveAnaliseData();
   res.json({ ok: true });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CHAT COM CFO VIRTUAL — conversa em tempo real com contexto financeiro completo
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── POST /api/chat-financeiro ─────────────────────────────────────────────────
+app.post('/api/chat-financeiro', async (req, res) => {
+  try {
+    const { mensagem, historico = [] } = req.body || {};
+    if (!mensagem || !mensagem.trim()) return res.status(400).json({ error: 'mensagem obrigatória' });
+
+    // Contexto: última análise gravada (não refaz chamada cara à API)
+    const ultimaAnalise  = analisesHistorico[0];
+    const dados          = ultimaAnalise?.dados_periodo || {};
+    const analise        = ultimaAnalise?.analise       || {};
+    const stripe         = dados?.stripe  || {};
+    const pagbank        = dados?.pagbank || {};
+    const periodo        = dados?.periodo || {};
+
+    const topClientes        = stripe.top_clientes            || [];
+    const semCobranca        = stripe.clientes_sem_cobranca   || [];
+    const distribuicaoPlanos = stripe.distribuicao_planos     || {};
+    const historicoTendencia = (conhecimentoFin.historico_analises || []).slice(-6);
+    const insightsAcumulados = (conhecimentoFin.insights_chat      || []).slice(-20);
+
+    // Concentração de receita por cliente (% do MRR)
+    const receitaTotal = stripe.receita_real_periodo || 0;
+    const topClientesFormatado = topClientes.map((c, i) => {
+      const pct = receitaTotal > 0 ? ((c.valor / receitaTotal) * 100).toFixed(1) : '?';
+      return `${i + 1}. **${c.nome}** — R$${c.valor.toFixed(2)} (${pct}% da receita)`;
+    }).join('\n');
+
+    const systemPrompt = `Você é o CFO Virtual da Abil, um assistente financeiro sênior com acesso completo e em tempo real aos dados da empresa. Responda sempre em português brasileiro com tom profissional e direto.
+
+## SNAPSHOT FINANCEIRO — Período ${periodo.inicio || '?'} a ${periodo.fim || '?'}
+
+### Stripe (Assinaturas)
+- MRR atual: **R$${(stripe.mrr || 0).toFixed(2)}**
+- Assinaturas ativas: **${stripe.assinaturas_ativas || 0}**
+- Cancelamentos no período: ${stripe.cancelamentos_periodo || 0}
+- Novos clientes: ${stripe.novos_clientes_periodo || 0}
+- Receita bruta Stripe no período: R$${(stripe.receita_real_periodo || 0).toFixed(2)}
+- Ticket médio: R$${(stripe.ticket_medio || 0).toFixed(2)}
+- LTV estimado: R$${(stripe.ltv_estimado || 0).toFixed(2)}
+- Distribuição de planos: ${JSON.stringify(distribuicaoPlanos)}
+
+### Top 5 Clientes por Receita (período)
+${topClientesFormatado || 'Dados ainda não disponíveis — gere uma análise primeiro'}
+
+### Clientes com assinatura ativa mas sem cobrança recente (risco churn)
+${semCobranca.length ? semCobranca.map(n => `- ${n}`).join('\n') : 'Nenhum identificado'}
+
+### PagBank (Implementações)
+- Implementações realizadas: ${pagbank.implementacoes_count || 0}
+- Receita de implementações: R$${(pagbank.receita_implementacoes || 0).toFixed(2)}
+- Distribuição por tipo: ${JSON.stringify(pagbank.distribuicao_tipos || {})}
+
+### Receita Total do Período
+- **R$${(dados?.totais?.receita_total_periodo || 0).toFixed(2)}** (Stripe + PagBank)
+
+## AVALIAÇÃO DO CFO
+- Saúde financeira: **${analise.saude_financeira || 'N/A'}**
+- Resumo executivo: ${analise.resumo_executivo || 'Análise não gerada ainda'}
+- Alertas: ${JSON.stringify((analise.alertas || []).slice(0, 3))}
+- Insights: ${JSON.stringify((analise.insights || []).slice(0, 3))}
+
+## TENDÊNCIA HISTÓRICA (últimas análises)
+${historicoTendencia.map(h =>
+  `• ${new Date(h.data).toLocaleDateString('pt-BR')}: MRR R$${h.mrr} | ${h.assinaturas} subs | ${h.saude}`
+).join('\n') || 'Primeira análise ainda'}
+
+## CONHECIMENTO ACUMULADO DE CONVERSAS
+${insightsAcumulados.length ? insightsAcumulados.map(i => `• ${i}`).join('\n') : 'Sem histórico de conversas'}
+
+## REGRAS DE RESPOSTA
+- Use **markdown**: negrito, listas, tabelas quando enriquecer a leitura
+- Seja específico: cite números reais dos dados acima
+- Se um dado não está disponível, diga claramente e explique o que precisaria
+- Para perguntas sobre clientes específicos, use os dados de top_clientes acima
+- Dê recomendações acionáveis, não genéricas
+- Máximo 600 palavras por resposta, a menos que o usuário peça detalhe`;
+
+    // Monta histórico da conversa (limita a 12 trocas para não explodir tokens)
+    const msgs = [
+      ...historico.slice(-12),
+      { role: 'user', content: mensagem.trim() },
+    ];
+
+    const resposta = await callClaudeMulti(systemPrompt, msgs, 2500);
+
+    // ── Acumula no knowledge base ────────────────────────────────────────────
+    conhecimentoFin.conversas = (conhecimentoFin.conversas || []);
+    conhecimentoFin.conversas.push({
+      pergunta:  mensagem.trim().slice(0, 200),
+      resposta:  resposta.slice(0, 600),
+      timestamp: new Date().toISOString(),
+    });
+    conhecimentoFin.conversas = conhecimentoFin.conversas.slice(-100);
+
+    // Salva resumo do insight como aprendizado
+    if (mensagem.trim().length > 15) {
+      conhecimentoFin.insights_chat = (conhecimentoFin.insights_chat || []);
+      const insight = `[${new Date().toLocaleDateString('pt-BR')}] P: "${mensagem.trim().slice(0, 80)}" → ${resposta.slice(0, 180)}`;
+      conhecimentoFin.insights_chat.push(insight);
+      conhecimentoFin.insights_chat = conhecimentoFin.insights_chat.slice(-30);
+    }
+
+    saveAnaliseData();
+    res.json({ resposta, timestamp: new Date().toISOString() });
+
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.listen(PORT, () => {
