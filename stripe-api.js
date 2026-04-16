@@ -3252,7 +3252,7 @@ app.post('/api/analise-financeira/feedback', (req, res) => {
 // ── POST /api/chat-financeiro ─────────────────────────────────────────────────
 app.post('/api/chat-financeiro', async (req, res) => {
   try {
-    const { mensagem, historico = [] } = req.body || {};
+    const { mensagem, historico = [], pagina_atual = null } = req.body || {};
     if (!mensagem || !mensagem.trim()) return res.status(400).json({ error: 'mensagem obrigatória' });
 
     // Contexto: última análise gravada (não refaz chamada cara à API)
@@ -3317,6 +3317,9 @@ ${historicoTendencia.map(h =>
 
 ## CONHECIMENTO ACUMULADO DE CONVERSAS
 ${insightsAcumulados.length ? insightsAcumulados.map(i => `• ${i}`).join('\n') : 'Sem histórico de conversas'}
+
+## PÁGINA ATUAL DO USUÁRIO
+${pagina_atual ? `O usuário está vendo a aba: **${pagina_atual}**. Priorize informações e insights relevantes para essa visão. Ex: se está em "Clientes", foque em análise de clientes; se em "Pagamentos", foque em cobranças e receita; se em "Falhas", foque em inadimplência; se em "PagBank", foque em implementações.` : 'Página não informada — responda de forma geral.'}
 
 ## REGRAS DE RESPOSTA
 - Use **markdown**: negrito, listas, tabelas quando enriquecer a leitura
