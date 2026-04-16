@@ -2908,6 +2908,301 @@ app.get('/api/clientes/:customerId/historico', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+// AGENTE ANALISTA FINANCEIRO — powered by Claude AI
+// ═══════════════════════════════════════════════════════════════════════════
+
+const ANALISE_DATA_FILE     = path.join(__dirname, 'analise-financeira.json');
+const CONHECIMENTO_FIN_FILE = path.join(__dirname, 'conhecimento-financeiro.json');
+
+let analisesHistorico = [];
+let conhecimentoFin   = {};
+
+function loadAnaliseData() {
+  try {
+    if (fs.existsSync(ANALISE_DATA_FILE))
+      analisesHistorico = JSON.parse(fs.readFileSync(ANALISE_DATA_FILE, 'utf8')) || [];
+    if (fs.existsSync(CONHECIMENTO_FIN_FILE))
+      conhecimentoFin = JSON.parse(fs.readFileSync(CONHECIMENTO_FIN_FILE, 'utf8')) || {};
+    console.log(`[Analise] ${analisesHistorico.length} análises carregadas`);
+  } catch(e) { console.error('[Analise] Erro ao carregar:', e.message); }
+}
+
+function saveAnaliseData() {
+  try {
+    fs.writeFileSync(ANALISE_DATA_FILE, JSON.stringify(analisesHistorico), 'utf8');
+    fs.writeFileSync(CONHECIMENTO_FIN_FILE, JSON.stringify(conhecimentoFin, null, 2), 'utf8');
+  } catch(e) { console.error('[Analise] Erro ao salvar:', e.message); }
+}
+
+loadAnaliseData();
+
+// ── Chamada à API Claude via https nativo ─────────────────────────────────────
+function callClaude(systemPrompt, userPrompt, maxTokens = 6000) {
+  return new Promise((resolve, reject) => {
+    const apiKey = process.env.ANTHROPIC_API_KEY || '';
+    if (!apiKey) return reject(new Error('ANTHROPIC_API_KEY não configurada'));
+
+    const body = JSON.stringify({
+      model: 'claude-opus-4-5',
+      max_tokens: maxTokens,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: userPrompt }],
+    });
+
+    const opts = {
+      hostname: 'api.anthropic.com',
+      path: '/v1/messages',
+      method: 'POST',
+      headers: {
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(body),
+      },
+    };
+
+    const req = https.request(opts, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          if (json.content?.[0]) resolve(json.content[0].text);
+          else reject(new Error('Claude error: ' + JSON.stringify(json).slice(0, 300)));
+        } catch(e) { reject(e); }
+      });
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
+// ── Coleta dados financeiros internamente ─────────────────────────────────────
+async function coletarDadosFinanceiros(inicioTs, fimTs) {
+  const agora  = Math.floor(Date.now() / 1000);
+  const inicio = inicioTs || (agora - 30 * 86400);
+  const fim    = fimTs    || agora;
+
+  const [charges, activeSubs, canceledSubs, allCustomers] = await Promise.all([
+    stripeListAll('charges', { 'created[gte]': String(inicio), 'created[lte]': String(fim) }),
+    stripeListAll('subscriptions', { status: 'active' }),
+    stripeListAll('subscriptions', { status: 'canceled' }).then(subs =>
+      subs.filter(s => s.ended_at && s.ended_at >= inicio)
+    ).catch(() => []),
+    stripeListAll('customers', {}),
+  ]);
+
+  // MRR snapshot + distribuição de planos
+  let mrr = 0;
+  const planCount = {};
+  for (const sub of activeSubs) {
+    for (const item of (sub.items?.data || [])) {
+      const price = item.price;
+      if (!price?.recurring) continue;
+      let v = (price.unit_amount || 0) / 100;
+      if (price.recurring.interval === 'year') v /= 12;
+      mrr += v * (item.quantity || 1);
+      const cat = classifyAssinatura(price.nickname || '', v);
+      planCount[cat] = (planCount[cat] || 0) + 1;
+    }
+  }
+
+  // Receita do período
+  const succeeded      = charges.filter(c => c.status === 'succeeded');
+  const cobranças_reais = succeeded.filter(c => !_isAutoRecharge(c));
+  const receitaReal    = cobranças_reais.reduce((s, c) => s + (c.amount || 0) / 100, 0);
+  const clientesUnicos = new Set(cobranças_reais.map(c => c.customer || c.billing_details?.email)).size;
+  const ticketMedio    = clientesUnicos > 0 ? receitaReal / clientesUnicos : 0;
+
+  // LTV médio
+  const agoraTs = Math.floor(Date.now() / 1000);
+  let somaVida = 0, countCust = 0;
+  for (const c of allCustomers) {
+    if (c.created) { somaVida += (agoraTs - c.created) / (30.44 * 86400); countCust++; }
+  }
+  const avgMeses = countCust > 0 ? somaVida / countCust : 12;
+
+  // Clientes com sub ativa mas sem cobrança no período (risco churn)
+  const clientesComCobranca = new Set(succeeded.map(c => c.customer));
+  const clientesRisco = activeSubs
+    .filter(s => !clientesComCobranca.has(s.customer))
+    .map(s => { const c = allCustomers.find(x => x.id === s.customer); return c?.name || c?.email || s.customer; })
+    .slice(0, 10);
+
+  // Top 5 clientes do período
+  const receitaPorCliente = {};
+  for (const ch of cobranças_reais) {
+    const cid = ch.customer || 'avulso';
+    receitaPorCliente[cid] = (receitaPorCliente[cid] || 0) + (ch.amount || 0) / 100;
+  }
+  const topClientes = Object.entries(receitaPorCliente)
+    .sort((a, b) => b[1] - a[1]).slice(0, 5)
+    .map(([cid, valor]) => {
+      const c = allCustomers.find(x => x.id === cid);
+      return { nome: c?.name || c?.email || cid, valor: parseFloat(valor.toFixed(2)) };
+    });
+
+  // PagBank — implementações do período
+  const pbReq = { query: { start: String(inicio), end: String(fim) } };
+  const { inicio: pbIn, fim: pbFim } = getPeriodoPagbank(pbReq);
+  const txsPB = await pagbankListAllTx(pbIn, pbFim).catch(() => []);
+  const IMPL_TIPOS = ['implementacao_basica', 'implementacao_personalizada', 'implementacao_avancada', 'implementacao'];
+  const implsPeriodo = txsPB.filter(tx => {
+    if (!['pago', 'disponivel'].includes(tx.status)) return false;
+    return IMPL_TIPOS.includes(classifyTipo(tx.link_pagamento || '', tx.bruto, tx.metodo, 'pagbank'));
+  });
+  const receitaImpl = implsPeriodo.reduce((s, t) => s + t.bruto, 0);
+  const implPorTipo = {};
+  for (const tx of implsPeriodo) {
+    const tipo = classifyTipo(tx.link_pagamento || '', tx.bruto, tx.metodo, 'pagbank');
+    implPorTipo[tipo] = (implPorTipo[tipo] || 0) + 1;
+  }
+
+  return {
+    periodo: {
+      inicio: new Date(inicio * 1000).toLocaleDateString('pt-BR'),
+      fim:    new Date(fim    * 1000).toLocaleDateString('pt-BR'),
+    },
+    stripe: {
+      mrr:                    parseFloat(mrr.toFixed(2)),
+      assinaturas_ativas:     activeSubs.length,
+      cancelamentos_periodo:  canceledSubs.length,
+      receita_real_periodo:   parseFloat(receitaReal.toFixed(2)),
+      ticket_medio:           parseFloat(ticketMedio.toFixed(2)),
+      ltv_estimado:           parseFloat((ticketMedio * avgMeses).toFixed(2)),
+      avg_meses_cliente:      parseFloat(avgMeses.toFixed(1)),
+      distribuicao_planos:    planCount,
+      clientes_sem_cobranca:  clientesRisco,
+      top_clientes:           topClientes,
+      novos_clientes_periodo: allCustomers.filter(c => c.created >= inicio && c.created <= fim).length,
+    },
+    pagbank: {
+      implementacoes_count:     implsPeriodo.length,
+      receita_implementacoes:   parseFloat(receitaImpl.toFixed(2)),
+      distribuicao_tipos:       implPorTipo,
+    },
+    totais: {
+      receita_total_periodo: parseFloat((receitaReal + receitaImpl).toFixed(2)),
+    },
+  };
+}
+
+// ── POST /api/analise-financeira ──────────────────────────────────────────────
+app.post('/api/analise-financeira', async (req, res) => {
+  try {
+    const { inicio, fim, forcar = false } = req.body || {};
+
+    // Cache de 3h
+    const ultima = analisesHistorico[0];
+    if (!forcar && ultima) {
+      const horas = (Date.now() - new Date(ultima.data).getTime()) / 3600000;
+      if (horas < 3) return res.json({ cache: true, analise: ultima });
+    }
+
+    const dados = await coletarDadosFinanceiros(inicio, fim);
+
+    const systemPrompt = `Você é um CFO / analista financeiro sênior especializado em SaaS B2B brasileiro.
+Analise os dados e retorne APENAS JSON válido, sem markdown, sem texto extra.
+Strings máximo 100 caracteres. Seja direto, específico e acionável.
+
+JSON schema EXATO:
+{
+  "resumo_executivo": "string",
+  "saude_financeira": "otima|boa|atencao|critica",
+  "mrr_analise": "string",
+  "insights": [{ "titulo": "string", "descricao": "string", "impacto": "alto|medio|baixo" }],
+  "alertas": [{ "titulo": "string", "descricao": "string", "urgencia": "imediata|esta_semana|proximo_mes" }],
+  "acoes_recomendadas": [{ "acao": "string", "motivo": "string", "prazo": "string" }],
+  "benchmark": { "churn_rate_estimado": "string", "ltv_cac_avaliacao": "string", "crescimento_estimado": "string" }
+}`;
+
+    const historicoCurto = (conhecimentoFin.historico_analises || []).slice(-3)
+      .map(h => ({ data: h.data, mrr: h.mrr, assinaturas: h.assinaturas, resumo: h.resumo, saude: h.saude }));
+
+    const userPrompt = `HISTÓRICO DAS ÚLTIMAS ANÁLISES:
+${JSON.stringify(historicoCurto)}
+
+FEEDBACKS DO USUÁRIO:
+${JSON.stringify((conhecimentoFin.feedbacks || []).slice(-10))}
+
+DADOS FINANCEIROS ATUAIS:
+${JSON.stringify(dados)}
+
+Gere análise completa como CFO/analista sênior.`;
+
+    const rawText = await callClaude(systemPrompt, userPrompt, 6000);
+
+    let analise;
+    try {
+      const clean = rawText.replace(/```json?\n?/g, '').replace(/```/g, '').trim();
+      analise = JSON.parse(clean);
+    } catch(e) {
+      return res.status(500).json({ error: 'JSON inválido do Claude', raw: rawText.slice(0, 500) });
+    }
+
+    const registro = { id: Date.now().toString(), data: new Date().toISOString(), dados_periodo: dados, analise };
+    analisesHistorico.unshift(registro);
+    if (analisesHistorico.length > 20) analisesHistorico = analisesHistorico.slice(0, 20);
+
+    conhecimentoFin.historico_analises = (conhecimentoFin.historico_analises || []);
+    conhecimentoFin.historico_analises.push({
+      data: registro.data, mrr: dados.stripe.mrr,
+      assinaturas: dados.stripe.assinaturas_ativas,
+      implementacoes: dados.pagbank.implementacoes_count,
+      resumo: analise.resumo_executivo, saude: analise.saude_financeira,
+    });
+    conhecimentoFin.historico_analises = conhecimentoFin.historico_analises.slice(-10);
+
+    saveAnaliseData();
+    res.json({ cache: false, analise: registro });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /api/analise-financeira/ultima ────────────────────────────────────────
+app.get('/api/analise-financeira/ultima', (req, res) => {
+  if (!analisesHistorico.length) return res.json({ analise: null });
+  res.json({ analise: analisesHistorico[0] });
+});
+
+// ── GET /api/analise-financeira/historico ─────────────────────────────────────
+app.get('/api/analise-financeira/historico', (req, res) => {
+  const limit = parseInt(req.query.limit || '10');
+  res.json({
+    total: analisesHistorico.length,
+    historico: analisesHistorico.slice(0, limit).map(a => ({
+      id: a.id, data: a.data,
+      saude: a.analise?.saude_financeira,
+      resumo: a.analise?.resumo_executivo,
+      mrr: a.dados_periodo?.stripe?.mrr,
+      assinaturas: a.dados_periodo?.stripe?.assinaturas_ativas,
+    })),
+  });
+});
+
+// ── POST /api/analise-financeira/feedback ─────────────────────────────────────
+app.post('/api/analise-financeira/feedback', (req, res) => {
+  const { analise_id, avaliacao, comentario } = req.body;
+  const analise = analisesHistorico.find(a => a.id === analise_id);
+  if (analise) {
+    analise.feedbacks = analise.feedbacks || [];
+    analise.feedbacks.push({ avaliacao, comentario, data: new Date().toISOString() });
+  }
+  if (comentario?.length > 5) {
+    conhecimentoFin.feedbacks = (conhecimentoFin.feedbacks || []);
+    conhecimentoFin.feedbacks.push({
+      avaliacao, comentario, data: new Date().toISOString(),
+      contexto: analise?.analise?.resumo_executivo?.slice(0, 80) || null,
+    });
+    conhecimentoFin.feedbacks = conhecimentoFin.feedbacks.slice(-50);
+  }
+  saveAnaliseData();
+  res.json({ ok: true });
+});
+
 app.listen(PORT, () => {
   console.log(`Stripe API backend rodando na porta ${PORT}`);
 });
