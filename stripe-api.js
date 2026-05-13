@@ -1580,6 +1580,76 @@ function saveMappings(mappings) {
 // Objeto em memoria (chave: stripe_customer_id, valor: { ghl_location_id, ghl_nome, stripe_nome, criado_em })
 let manualMappings = loadMappings();
 
+// GET /api/ghl/locations/campos — mostra todos os campos brutos das primeiras 5 locations
+// Usado para diagnóstico: descobrir quais campos indicam se uma subconta é ativa
+app.get('/api/ghl/locations/campos', async (req, res) => {
+  try {
+    const r = await ghlRequest('/locations/search?limit=5&skip=0');
+    const locs = (r.body && r.body.locations) ? r.body.locations : [];
+    // Retorna os campos completos para inspeção
+    res.json({
+      total_campos: locs[0] ? Object.keys(locs[0]).length : 0,
+      campos_disponiveis: locs[0] ? Object.keys(locs[0]) : [],
+      amostra: locs.map(l => ({
+        id: l.id,
+        name: l.name,
+        // Todos os campos potenciais de status/atividade
+        saasSubscriptionStatus: l.saasSubscriptionStatus,
+        suspended: l.suspended,
+        isActive: l.isActive,
+        plan: l.plan,
+        trialEndDate: l.trialEndDate,
+        subscriptionStatus: l.subscriptionStatus,
+        status: l.status,
+        active: l.active,
+        disabled: l.disabled,
+        // Campos de data que podem indicar atividade
+        createdAt: l.createdAt,
+        updatedAt: l.updatedAt,
+        // Campos financeiros GHL
+        stripeProductId: l.stripeProductId,
+        stripePriceId: l.stripePriceId,
+        stripeCustomerId: l.stripeCustomerId,
+        // Campos gerais
+        email: l.email,
+        phone: l.phone,
+        website: l.website,
+        // Raw completo para não perder nada
+        _raw: l,
+      })),
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/ghl/locations/distribuicao-status — conta quantas locations há por valor de saasSubscriptionStatus
+// Essencial para entender qual filtro usar para "clientes ativos"
+app.get('/api/ghl/locations/distribuicao-status', async (req, res) => {
+  try {
+    const locations = await ghlGetAllLocations();
+    const dist = {};
+    const planDist = {};
+    let comStripeCustomerId = 0;
+    for (const l of locations) {
+      const s = l.saasSubscriptionStatus || l.subscriptionStatus || l.status || 'sem_campo';
+      dist[s] = (dist[s] || 0) + 1;
+      const p = l.plan || 'sem_plano';
+      planDist[p] = (planDist[p] || 0) + 1;
+      if (l.stripeCustomerId) comStripeCustomerId++;
+    }
+    res.json({
+      total: locations.length,
+      por_saasSubscriptionStatus: dist,
+      por_plan: planDist,
+      com_stripeCustomerId_ghl: comStripeCustomerId,
+      // Amostra de 3 locations com status 'active' se houver
+      amostra_active: locations
+        .filter(l => ['active','Active','ACTIVE'].includes(l.saasSubscriptionStatus))
+        .slice(0, 3)
+        .map(l => ({ id: l.id, name: l.name, saasSubscriptionStatus: l.saasSubscriptionStatus, plan: l.plan, suspended: l.suspended })),
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // GET /api/ghl/locations — lista todas as subcontas GHL em tempo real (para dropdown de vinculação)
 app.get('/api/ghl/locations', async (req, res) => {
   try {
