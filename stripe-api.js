@@ -633,14 +633,20 @@ function classifyTipo(descricao, valor, metodo, plataforma) {
   // 'recorrente' só é assinatura no Stripe; no PagBank type 11 é apenas método de pagamento
   if (metodo === 'recorrente' && plataforma !== 'pagbank') return 'assinatura';
   const desc = (descricao || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  // Detectar mensalidade/assinatura explícita na descrição — evita classificar como implementação
+  // Cobre links PagBank nomeados "Mensalidade CRM", "Plano Mensal", "Assinatura", etc.
+  if (/mensalidad|mensalidade|mensal\b|plano\s+mensal|assinatura|subscription|renovacao|recorrente/.test(desc)) return 'assinatura';
+
   if (desc.includes('implementa')) {
     if (desc.includes('avancada') || valor > 5000) return 'implementacao_avancada';
     if (desc.includes('personalizada') || (valor >= 2500 && valor <= 5000)) return 'implementacao_personalizada';
     if (desc.includes('basica') || valor < 2500) return 'implementacao_basica';
     return 'implementacao';
   }
-  // PagBank: todos sao implementacoes — classificar por valor
+  // PagBank sem descrição conclusiva: classificar por valor
+  // Valores abaixo de R$200 são variáveis (ruído, não tipicamente implementações)
   if (plataforma === 'pagbank') {
+    if (valor < 200) return 'variavel';
     if (valor > 5000) return 'implementacao_avancada';
     if (valor >= 2500) return 'implementacao_personalizada';
     return 'implementacao_basica';
@@ -2033,6 +2039,30 @@ function saveNfData() {
 // Carregar dados de NF ao iniciar o servidor
 loadNfData();
 
+// ============================================================
+// GESTÃO DE CLIENTES — persistência de dados cadastrais,
+// status de implementação e NF por cliente (GHL location ID)
+// ============================================================
+
+const GESTAO_FILE = path.join(__dirname, 'clientes-gestao.json');
+let clientesGestaoData = {};
+
+function loadGestaoData() {
+  try {
+    if (fs.existsSync(GESTAO_FILE)) {
+      clientesGestaoData = JSON.parse(fs.readFileSync(GESTAO_FILE, 'utf8'));
+      console.log(`[Gestao] ${Object.keys(clientesGestaoData).length} clientes carregados`);
+    }
+  } catch(e) { console.error('[Gestao] Erro ao carregar clientes-gestao.json:', e.message); }
+}
+
+function saveGestaoData() {
+  try { fs.writeFileSync(GESTAO_FILE, JSON.stringify(clientesGestaoData, null, 2)); }
+  catch(e) { console.error('[Gestao] Erro ao salvar clientes-gestao.json:', e.message); }
+}
+
+loadGestaoData();
+
 function mesAnoAtual() {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
@@ -3369,6 +3399,429 @@ ${pagina_atual ? `O usuário está vendo a aba: **${pagina_atual}**. Priorize in
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// ============================================================
+// GESTÃO DE CLIENTES — endpoints da nova aba financeira
+// ============================================================
+
+// Determina o status de uma invoice Stripe de forma semântica
+function resolveInvoiceStatus(inv) {
+  if (!inv) return null;
+  if (inv.status === 'paid') return 'pago';
+  if (inv.status === 'void' || inv.status === 'uncollectible') return 'cancelado';
+  if (inv.status === 'open') {
+    const agora = Math.floor(Date.now() / 1000);
+    if (inv.due_date && inv.due_date < agora) return 'em_atraso';
+    return 'pendente';
+  }
+  return 'pendente';
+}
+
+// Reutiliza a mesma lógica de cruzamento do /api/ghl/cruzamento
+// para evitar duplicação de código
+function cruzarGHLcomStripe(locations, stripeClientes) {
+  const matchedStripeIds = new Set();
+  const resultado = locations.map(loc => {
+    const nomeGHL = loc.name || '';
+    const locId = loc.id;
+    let match = null;
+    let mapeamentoManual = false;
+
+    for (const [stripeId, map] of Object.entries(manualMappings)) {
+      if (map.ghl_location_id === locId) {
+        const cliente = stripeClientes.find(c => c.id === stripeId);
+        if (cliente && !matchedStripeIds.has(cliente.id)) {
+          match = cliente; mapeamentoManual = true; break;
+        }
+      }
+    }
+    if (!match) match = stripeClientes.find(c =>
+      !matchedStripeIds.has(c.id) &&
+      normalizeName(c.nome) === normalizeName(nomeGHL) &&
+      normalizeName(nomeGHL).length >= 3
+    );
+    if (!match) {
+      match = stripeClientes.find(c => {
+        if (matchedStripeIds.has(c.id)) return false;
+        const na = normalizeName(c.nome);
+        const nb = normalizeName(nomeGHL);
+        if (!na || !nb || na.length < 4 || nb.length < 4) return false;
+        const shorter = na.length < nb.length ? na : nb;
+        const longer  = na.length < nb.length ? nb : na;
+        if (shorter.length >= 6 && longer.includes(shorter)) return true;
+        const wordsA = na.split(' ').filter(w => w.length >= 5);
+        const wordsB = new Set(nb.split(' ').filter(w => w.length >= 5));
+        return wordsA.filter(w => wordsB.has(w)).length >= 2;
+      });
+    }
+    if (match) matchedStripeIds.add(match.id);
+    return { loc, match, mapeamentoManual };
+  });
+  return resultado;
+}
+
+// GET /api/clientes/gestao?mes=YYYY-MM
+// Retorna todos os clientes GHL enriquecidos com status de implementação,
+// mensalidade do mês selecionado e dados cadastrais persistidos manualmente.
+app.get('/api/clientes/gestao', async (req, res) => {
+  try {
+    const mes = req.query.mes || mesAnoAtual();
+    if (!/^\d{4}-\d{2}$/.test(mes)) return res.status(400).json({ error: 'Formato inválido. Use YYYY-MM' });
+    const [ano, m] = mes.split('-').map(Number);
+
+    // Timestamps do mês selecionado (para buscar invoices criadas no período)
+    const inicioMes = Math.floor(new Date(ano, m - 1, 1).getTime() / 1000);
+    const fimMes    = Math.floor(new Date(ano, m, 0, 23, 59, 59).getTime() / 1000);
+
+    // Busca paralela: locations GHL, customers Stripe, assinaturas ativas, invoices do mês
+    const [locations, stripeCustomers, stripeSubs, invoicesMes] = await Promise.all([
+      ghlGetAllLocations(),
+      stripeListAll('customers', {}),
+      stripeListAll('subscriptions', { status: 'active' }),
+      stripeListAll('invoices', {
+        'created[gte]': String(inicioMes),
+        'created[lte]': String(fimMes),
+      }),
+    ]);
+
+    // Mapa customer_id → MRR e info da subscription ativa
+    const subByCustomer = {};
+    for (const sub of stripeSubs) {
+      if (!sub.customer) continue;
+      let mrr = 0;
+      for (const item of (sub.items?.data || [])) {
+        const price = item.price;
+        if (!price?.recurring) continue;
+        let v = (price.unit_amount || 0) / 100;
+        const interval = price.recurring.interval;
+        const cnt = price.recurring.interval_count || 1;
+        if (interval === 'year')  v = (v / 12) / cnt;
+        else if (interval === 'week') v = (v * 4.33) / cnt;
+        else v = v / cnt;
+        mrr += v * (item.quantity || 1);
+      }
+      subByCustomer[sub.customer] = {
+        id: sub.id,
+        status: sub.status,
+        valor: parseFloat(mrr.toFixed(2)),
+        plano: sub.items?.data?.[0]?.price?.nickname || null,
+        proximo_vencimento: sub.current_period_end
+          ? new Date(sub.current_period_end * 1000).toISOString().substring(0, 10) : null,
+      };
+    }
+
+    // Clientes Stripe com assinatura ativa (base para cruzamento)
+    const stripeClientes = stripeCustomers.map(c => ({
+      id: c.id,
+      nome: c.name || '',
+      email: c.email || '',
+      sub: subByCustomer[c.id] || null,
+    })).filter(c => c.sub !== null);
+
+    // Mapa customer_id → invoice mais recente do mês selecionado
+    const invoiceByCustomer = {};
+    for (const inv of invoicesMes) {
+      if (!inv.customer) continue;
+      if (!invoiceByCustomer[inv.customer] || inv.created > invoiceByCustomer[inv.customer].created) {
+        invoiceByCustomer[inv.customer] = inv;
+      }
+    }
+
+    // Cruzamento GHL × Stripe
+    const cruzados = cruzarGHLcomStripe(locations, stripeClientes);
+
+    const agora = Math.floor(Date.now() / 1000);
+    const isMesFuturo = inicioMes > agora;
+
+    const clientes = cruzados.map(({ loc, match, mapeamentoManual }) => {
+      const locId  = loc.id;
+      const nomeGHL = loc.name || '';
+      const dadosManuais = clientesGestaoData[locId] || {};
+      const overridesMes = dadosManuais.meses?.[mes] || {};
+
+      // Status de mensalidade para o mês
+      let mensalidade = null;
+      if (match) {
+        const inv = invoiceByCustomer[match.id];
+        if (inv) {
+          const statusAuto = resolveInvoiceStatus(inv);
+          mensalidade = {
+            invoice_id: inv.id,
+            status: overridesMes.status_mensalidade || statusAuto,
+            status_auto: statusAuto,
+            valor: parseFloat(((inv.amount_due || 0) / 100).toFixed(2)),
+            valor_pago: parseFloat(((inv.amount_paid || 0) / 100).toFixed(2)),
+            data_vencimento: inv.due_date
+              ? new Date(inv.due_date * 1000).toISOString().substring(0, 10) : null,
+            data_pagamento: inv.status_transitions?.paid_at
+              ? new Date(inv.status_transitions.paid_at * 1000).toISOString().substring(0, 10) : null,
+            nf_emitida: overridesMes.nf_mensalidade ?? false,
+          };
+        } else if (match.sub) {
+          // Assinatura ativa mas sem invoice no mês — futuro ou mês sem cobrança ainda
+          mensalidade = {
+            invoice_id: null,
+            status: overridesMes.status_mensalidade || (isMesFuturo ? 'futuro' : 'pendente'),
+            status_auto: isMesFuturo ? 'futuro' : 'pendente',
+            valor: match.sub.valor,
+            valor_pago: 0,
+            data_vencimento: match.sub.proximo_vencimento,
+            data_pagamento: null,
+            nf_emitida: overridesMes.nf_mensalidade ?? false,
+          };
+        }
+      }
+
+      // Implementação: usa dados manuais persistidos como fonte principal
+      const impl = dadosManuais.implementacao || {};
+      const implementacao = {
+        status: impl.status || 'nao_informado',
+        valor: impl.valor || null,
+        parcelas: impl.parcelas || null,
+        nf_emitida: impl.nf_emitida ?? false,
+        data_pagamento: impl.data_pagamento || null,
+      };
+
+      return {
+        ghl_id: locId,
+        ghl_nome: nomeGHL,
+        stripe_customer_id: match ? match.id : null,
+        stripe_email: match ? match.email : null,
+        stripe_encontrado: !!match,
+        mapeamento_manual: mapeamentoManual,
+        // Dados cadastrais (entrada manual via PATCH)
+        cnpj: dadosManuais.cnpj || null,
+        responsavel: dadosManuais.responsavel || null,
+        email_financeiro: dadosManuais.email_financeiro || null,
+        telefone: dadosManuais.telefone || null,
+        observacoes: dadosManuais.observacoes || null,
+        // Assinatura atual
+        assinatura: match ? match.sub : null,
+        // Mensalidade do mês selecionado
+        mensalidade,
+        // Status de implementação
+        implementacao,
+      };
+    });
+
+    // Ordena: Stripe encontrado primeiro, depois por nome
+    clientes.sort((a, b) => {
+      if (a.stripe_encontrado !== b.stripe_encontrado) return a.stripe_encontrado ? -1 : 1;
+      return (a.ghl_nome || '').localeCompare(b.ghl_nome || '', 'pt-BR');
+    });
+
+    const pagos    = clientes.filter(c => c.mensalidade?.status === 'pago').length;
+    const pendente = clientes.filter(c => ['pendente', 'em_atraso'].includes(c.mensalidade?.status)).length;
+
+    res.json({
+      mes,
+      total: clientes.length,
+      com_stripe: clientes.filter(c => c.stripe_encontrado).length,
+      sem_stripe: clientes.filter(c => !c.stripe_encontrado).length,
+      mensalidade_paga: pagos,
+      mensalidade_pendente: pendente,
+      clientes,
+      gerado_em: new Date().toISOString(),
+    });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// PATCH /api/clientes/gestao/:ghl_id
+// Atualiza dados cadastrais do cliente: CNPJ, responsável, email, telefone, observações
+app.patch('/api/clientes/gestao/:ghl_id', (req, res) => {
+  const { ghl_id } = req.params;
+  const { cnpj, responsavel, email_financeiro, telefone, observacoes } = req.body || {};
+  if (!clientesGestaoData[ghl_id]) clientesGestaoData[ghl_id] = {};
+  const d = clientesGestaoData[ghl_id];
+  if (cnpj              !== undefined) d.cnpj              = cnpj;
+  if (responsavel       !== undefined) d.responsavel       = responsavel;
+  if (email_financeiro  !== undefined) d.email_financeiro  = email_financeiro;
+  if (telefone          !== undefined) d.telefone          = telefone;
+  if (observacoes       !== undefined) d.observacoes       = observacoes;
+  saveGestaoData();
+  res.json({ ok: true, ghl_id, dados: d });
+});
+
+// PATCH /api/clientes/gestao/:ghl_id/mensalidade/:mes
+// Sobrescreve manualmente o status de mensalidade e/ou NF de um mês específico
+// Body: { status?: 'pago'|'pendente'|'em_atraso'|'futuro'|'cancelado', nf_emitida?: boolean }
+app.patch('/api/clientes/gestao/:ghl_id/mensalidade/:mes', (req, res) => {
+  const { ghl_id, mes } = req.params;
+  if (!/^\d{4}-\d{2}$/.test(mes)) return res.status(400).json({ error: 'Formato inválido. Use YYYY-MM' });
+  const { status, nf_emitida } = req.body || {};
+  const STATUS_VALIDOS = ['pago', 'pendente', 'em_atraso', 'futuro', 'cancelado'];
+  if (status && !STATUS_VALIDOS.includes(status)) {
+    return res.status(400).json({ error: 'status inválido. Use: ' + STATUS_VALIDOS.join(', ') });
+  }
+  if (!clientesGestaoData[ghl_id]) clientesGestaoData[ghl_id] = {};
+  if (!clientesGestaoData[ghl_id].meses) clientesGestaoData[ghl_id].meses = {};
+  if (!clientesGestaoData[ghl_id].meses[mes]) clientesGestaoData[ghl_id].meses[mes] = {};
+  const m = clientesGestaoData[ghl_id].meses[mes];
+  if (status      !== undefined) m.status_mensalidade = status;
+  if (nf_emitida  !== undefined) m.nf_mensalidade     = !!nf_emitida;
+  m.atualizado_em = new Date().toISOString();
+  saveGestaoData();
+  res.json({ ok: true, ghl_id, mes, override: m });
+});
+
+// PATCH /api/clientes/gestao/:ghl_id/implementacao
+// Registra ou atualiza status da implementação (pagamento único) do cliente
+// Body: { status, valor, parcelas: { total, pagas }, nf_emitida, data_pagamento }
+app.patch('/api/clientes/gestao/:ghl_id/implementacao', (req, res) => {
+  const { ghl_id } = req.params;
+  const { status, valor, parcelas, nf_emitida, data_pagamento } = req.body || {};
+  const STATUS_VALIDOS = ['pago', 'pendente', 'nao_pago', 'parcelado', 'nao_informado'];
+  if (status && !STATUS_VALIDOS.includes(status)) {
+    return res.status(400).json({ error: 'status inválido. Use: ' + STATUS_VALIDOS.join(', ') });
+  }
+  if (!clientesGestaoData[ghl_id]) clientesGestaoData[ghl_id] = {};
+  if (!clientesGestaoData[ghl_id].implementacao) clientesGestaoData[ghl_id].implementacao = {};
+  const impl = clientesGestaoData[ghl_id].implementacao;
+  if (status         !== undefined) impl.status         = status;
+  if (valor          !== undefined) impl.valor          = valor;
+  if (parcelas       !== undefined) impl.parcelas       = parcelas;
+  if (nf_emitida     !== undefined) impl.nf_emitida     = !!nf_emitida;
+  if (data_pagamento !== undefined) impl.data_pagamento = data_pagamento;
+  impl.atualizado_em = new Date().toISOString();
+  saveGestaoData();
+  res.json({ ok: true, ghl_id, implementacao: impl });
+});
+
+// GET /api/clientes/gestao/:ghl_id/implementacao/detectar
+// Busca automaticamente transações de implementação no Stripe e PagBank para o cliente.
+// Retorna candidatos sem salvar nada — o usuário confirma manualmente via PATCH.
+app.get('/api/clientes/gestao/:ghl_id/implementacao/detectar', async (req, res) => {
+  try {
+    const { ghl_id } = req.params;
+
+    // Encontrar o Stripe customer correspondente via cruzamento
+    const [locations, stripeCustomers, stripeSubs] = await Promise.all([
+      ghlGetAllLocations(),
+      stripeListAll('customers', {}),
+      stripeListAll('subscriptions', { status: 'active' }),
+    ]);
+
+    const loc = locations.find(l => l.id === ghl_id);
+    if (!loc) return res.status(404).json({ error: 'GHL location não encontrado' });
+
+    const stripeClientes = stripeCustomers.map(c => ({
+      id: c.id, nome: c.name || '', email: c.email || '',
+      sub: (() => {
+        const sub = stripeSubs.find(s => s.customer === c.id);
+        return sub ? { id: sub.id, status: sub.status } : null;
+      })(),
+    })).filter(c => c.sub !== null);
+
+    const cruzados = cruzarGHLcomStripe([loc], stripeClientes);
+    const { match } = cruzados[0];
+
+    const IMPL_TIPOS = ['implementacao_basica', 'implementacao_personalizada', 'implementacao_avancada', 'implementacao'];
+    const candidatos = [];
+
+    // Stripe: cobranças não vinculadas a invoice (pagamentos avulsos = implementações potenciais)
+    if (match) {
+      const chargesCliente = await stripeListAll('charges', {
+        customer: match.id,
+        'expand[]': 'data.balance_transaction',
+      });
+      for (const c of chargesCliente) {
+        if (c.status !== 'succeeded') continue;
+        if (c.invoice) continue; // invoice = mensalidade, não implementação
+        if (_isAutoRecharge(c)) continue; // GHL auto-recharge
+        const valor = (c.amount || 0) / 100;
+        const tipo = classifyTipo(c.description, valor, 'avulso', 'stripe');
+        if (!IMPL_TIPOS.includes(tipo)) continue;
+        candidatos.push({
+          plataforma: 'stripe',
+          id: c.id,
+          data: new Date(c.created * 1000).toISOString().substring(0, 10),
+          valor,
+          descricao: c.description || '',
+          tipo,
+          status_pagamento: 'pago',
+          metodo: c.payment_method_details?.type || 'cartao',
+          parcelas: c.payment_method_details?.card?.installments?.plan?.count || 1,
+        });
+      }
+    }
+
+    // PagBank: transações dos últimos 12 meses classificadas como implementação
+    try {
+      const agora = new Date();
+      const inicio12m = new Date(agora.getTime() - 365 * 24 * 60 * 60 * 1000);
+      const pad = n => String(n).padStart(2, '0');
+      const toPS = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+      const txsPB = await pagbankListAllTx(toPS(inicio12m), toPS(agora));
+
+      const refMapDet = {};
+      txsPB.forEach(tx => { if (tx.referencia && !refMapDet[tx.referencia]) refMapDet[tx.referencia] = tx.id; });
+      await Promise.all(Object.entries(refMapDet).map(([ref, code]) => fetchLinkNome(ref, code)));
+
+      // Email do cliente Stripe para tentar cruzar com PagBank
+      const emailCliente = (match?.email || '').toLowerCase();
+      const nomeCliente  = normStr(loc.name || '');
+
+      for (const tx of txsPB) {
+        if (!['pago', 'disponivel'].includes(tx.status)) continue;
+        const desc = linkNomeCache[tx.referencia] || tx.link_pagamento || '';
+        const tipo = classifyTipo(desc, tx.bruto, tx.metodo, 'pagbank');
+        if (!IMPL_TIPOS.includes(tipo)) continue;
+
+        // Tentar associar ao cliente por email ou nome
+        const sender = senderCache[tx.id] || {};
+        const txEmail = (sender.email || tx.email || '').toLowerCase();
+        const txNome  = normStr(sender.nome || tx.nome || '');
+
+        const matchEmail = emailCliente && txEmail && txEmail === emailCliente;
+        const matchNome  = nomeCliente.length >= 4 && txNome.length >= 4 &&
+          (txNome.includes(nomeCliente) || nomeCliente.includes(txNome));
+
+        if (!matchEmail && !matchNome && emailCliente) continue;
+
+        candidatos.push({
+          plataforma: 'pagbank',
+          id: tx.id,
+          data: tx.data,
+          valor: tx.bruto,
+          valor_liquido: tx.liquido,
+          descricao: desc,
+          tipo,
+          status_pagamento: 'pago',
+          metodo: tx.metodo,
+          parcelas: parcelasCache[tx.id] || tx.parcelas || 1,
+          nome_pagador: sender.nome || tx.nome || null,
+          email_pagador: txEmail || null,
+          match_por: matchEmail ? 'email' : matchNome ? 'nome' : 'sem_filtro',
+        });
+      }
+    } catch(e) { /* PagBank indisponível — retorna só Stripe */ }
+
+    candidatos.sort((a, b) => new Date(b.data) - new Date(a.data));
+
+    res.json({
+      ghl_id,
+      ghl_nome: loc.name,
+      stripe_customer_id: match ? match.id : null,
+      total_candidatos: candidatos.length,
+      candidatos,
+      nota: 'Use PATCH /api/clientes/gestao/' + ghl_id + '/implementacao para confirmar o status.',
+    });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/clientes/gestao/exportar — exporta todos os dados persistidos (backup)
+app.get('/api/clientes/gestao/exportar', (req, res) => {
+  res.json({ total: Object.keys(clientesGestaoData).length, dados: clientesGestaoData });
+});
+
+// POST /api/clientes/gestao/importar — restaura dados de backup
+app.post('/api/clientes/gestao/importar', (req, res) => {
+  const { dados } = req.body || {};
+  if (!dados || typeof dados !== 'object') return res.status(400).json({ error: 'body.dados obrigatório (objeto)' });
+  Object.assign(clientesGestaoData, dados);
+  saveGestaoData();
+  res.json({ ok: true, total: Object.keys(clientesGestaoData).length });
 });
 
 app.listen(PORT, () => {
