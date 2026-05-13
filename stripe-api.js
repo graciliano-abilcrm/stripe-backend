@@ -740,6 +740,74 @@ async function fetchLinkNome(referencia, txCode) {
   return null;
 }
 
+// Busca dados do sender via detalhe individual da transação PagBank.
+// Usado para transações sem <reference> (ex: Text2Pay) onde o listing não retorna sender completo.
+const fetchSenderDetailPromises = {}; // evita chamadas duplicadas concorrentes
+async function fetchSenderDetail(txCode) {
+  if (!txCode || senderCache[txCode]) return;
+  if (fetchSenderDetailPromises[txCode]) return fetchSenderDetailPromises[txCode];
+  fetchSenderDetailPromises[txCode] = (async () => {
+    try {
+      const result = await pagbankLegacyRequest('/v3/transactions/' + txCode);
+      if (result._status === 200 && result._body.includes('<transaction>')) {
+        const senderXml = result._body.match(/<sender[^>]*>([\s\S]*?)<\/sender>/);
+        const itemXml   = result._body.match(/<item[^>]*>([\s\S]*?)<\/item>/);
+        if (senderXml) {
+          const phoneXml = senderXml[1].match(/<phone[^>]*>([\s\S]*?)<\/phone>/);
+          const ac = phoneXml ? xmlVal(phoneXml[1], 'areaCode') : '';
+          const pn = phoneXml ? xmlVal(phoneXml[1], 'number') : '';
+          const nome  = xmlVal(senderXml[1], 'name')  || null;
+          const email = xmlVal(senderXml[1], 'email') || null;
+          senderCache[txCode] = {
+            nome:     nome  && nome  !== 'N/A' ? nome  : null,
+            email:    email && email !== 'N/A' ? email : null,
+            telefone: ac && pn ? `(${ac}) ${pn}` : null,
+          };
+        }
+        if (itemXml) {
+          const desc = xmlVal(itemXml[1], 'description');
+          if (desc && desc !== 'N/A') {
+            // Se essa tx não tinha referencia, guardamos a descrição do item no cache de nomes
+            // usando o txCode como chave alternativa
+            if (!linkNomeCache['__tx__' + txCode]) linkNomeCache['__tx__' + txCode] = desc;
+          }
+        }
+      }
+    } catch (e) { console.error('[fetchSenderDetail] txCode:', txCode, e.message); }
+  })();
+  return fetchSenderDetailPromises[txCode];
+}
+
+// Helper: garante sender data para lote de transações sem referencia e sem nome
+async function ensureSenderData(txs) {
+  const sem = txs.filter(tx => !tx.referencia && (!tx.nome || tx.nome === 'N/A') && !senderCache[tx.id]);
+  if (sem.length > 0) {
+    await Promise.all(sem.map(tx => fetchSenderDetail(tx.id)));
+  }
+}
+
+// Helper: monta nome/email/telefone/descricao final enriquecido para uma tx PagBank
+function enrichTx(tx) {
+  const parcelas = parcelasCache[tx.id] || tx.parcelas;
+  const sender   = senderCache[tx.id] || {};
+  const linkDesc = linkNomeCache[tx.referencia]
+    || linkNomeCache['__tx__' + tx.id]
+    || tx.link_pagamento;
+  return {
+    ...tx,
+    nome:     (sender.nome)  || (tx.nome  && tx.nome  !== 'N/A' ? tx.nome  : null),
+    email:    (sender.email) || (tx.email && tx.email !== 'N/A' ? tx.email : null),
+    telefone: sender.telefone || tx.telefone || null,
+    link_pagamento:       linkDesc,
+    descricao:            linkDesc || null,
+    tipo:                 classifyTipo(linkDesc, tx.bruto, tx.metodo, 'pagbank'),
+    parcelas,
+    valor_liquido:        tx.liquido,
+    previsao_recebimento: calcPrevisaoRecebimento(tx.data, tx.metodo, parcelas, tx.status, 'pagbank'),
+  };
+}
+
+
 function parseTx(txXml) {
   const pmMatch = txXml.match(/<paymentMethod[^>]*>([\s\S]*?)<\/paymentMethod>/);
   const pmType = pmMatch ? xmlVal(pmMatch[1], 'type') : '';
@@ -930,26 +998,14 @@ app.get('/api/pagbank/transacoes', async (req, res) => {
     const txs = await pagbankListAllTx(inicio, fim);
     txs.sort((a, b) => new Date(b.data) - new Date(a.data));
 
-    // Enriquecer com nome real do link (busca em paralelo, com cache)
+    // 1ª passagem: link names para txs com referencia
     const refToTxCode1 = {}; txs.forEach(tx => { if (tx.referencia && !refToTxCode1[tx.referencia]) refToTxCode1[tx.referencia] = tx.id; });
     await Promise.all(Object.entries(refToTxCode1).map(([ref, code]) => fetchLinkNome(ref, code)));
 
-    const enriquecidas = txs.map(tx => {
-      const parcelas = parcelasCache[tx.id] || tx.parcelas;
-      const sender = senderCache[tx.id] || {};
-      return {
-        ...tx,
-        nome: (sender.nome && sender.nome !== 'N/A') ? sender.nome : (tx.nome !== 'N/A' ? tx.nome : null),
-        email: (sender.email && sender.email !== 'N/A') ? sender.email : (tx.email !== 'N/A' ? tx.email : null),
-        telefone: sender.telefone || tx.telefone || null,
-        link_pagamento: linkNomeCache[tx.referencia] || tx.link_pagamento,
-        descricao: linkNomeCache[tx.referencia] || tx.link_pagamento || null,
-        tipo: classifyTipo(linkNomeCache[tx.referencia] || tx.link_pagamento, tx.bruto, tx.metodo, 'pagbank'),
-        parcelas,
-        valor_liquido: tx.liquido, // alias para consistencia com Stripe
-        previsao_recebimento: calcPrevisaoRecebimento(tx.data, tx.metodo, parcelas, tx.status, 'pagbank'),
-      };
-    });
+    // 2ª passagem: sender detail para txs sem referencia e sem nome (ex: Text2Pay)
+    await ensureSenderData(txs);
+
+    const enriquecidas = txs.map(enrichTx);
 
     res.json({ transacoes: enriquecidas, total: enriquecidas.length });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -1068,20 +1124,23 @@ app.get('/api/pagamentos', async (req, res) => {
     // Enriquecer PagBank com nome real do link (cache compartilhado)
     const refToTxCode2 = {}; txsPagbank.forEach(tx => { if (tx.referencia && !refToTxCode2[tx.referencia]) refToTxCode2[tx.referencia] = tx.id; });
     await Promise.all(Object.entries(refToTxCode2).map(([ref, code2]) => fetchLinkNome(ref, code2)));
+    // Fallback: busca sender detail para txs sem referencia e sem nome (ex: Text2Pay)
+    await ensureSenderData(txsPagbank);
 
     const pagbank = txsPagbank.map(tx => {
-      const nomeLink = linkNomeCache[tx.referencia] || tx.link_pagamento;
+      const nomeLink = linkNomeCache[tx.referencia] || linkNomeCache['__tx__' + tx.id] || tx.link_pagamento;
       const parcelas = parcelasCache[tx.id] || tx.parcelas;
       const statusStr = tx.status === 'disponivel' || tx.status === 'pago' ? 'aprovado' : tx.status === 'cancelado' || tx.status === 'devolvido' ? 'falhou' : tx.status;
+      const snd = senderCache[tx.id] || {};
       return {
         id: tx.id,
         plataforma: 'pagbank',
         valor: tx.bruto,
         valor_liquido: tx.liquido,
         taxa: tx.taxa,
-        nome: (senderCache[tx.id]?.nome) || (tx.nome && tx.nome !== 'N/A' ? tx.nome : null),
-        email: (senderCache[tx.id]?.email) || (tx.email && tx.email !== 'N/A' ? tx.email : null),
-        telefone: (senderCache[tx.id]?.telefone) || tx.telefone || null,
+        nome: snd.nome || (tx.nome && tx.nome !== 'N/A' ? tx.nome : null),
+        email: snd.email || (tx.email && tx.email !== 'N/A' ? tx.email : null),
+        telefone: snd.telefone || tx.telefone || null,
         status: statusStr,
         descricao: nomeLink || tx.referencia || '',
         subconta: nomeLink || '',
@@ -1726,6 +1785,7 @@ app.get('/api/pagbank/transacoes/recentes', async (req, res) => {
     const refMap = {};
     txs.forEach(tx => { if (tx.referencia && !refMap[tx.referencia]) refMap[tx.referencia] = tx.id; });
     await Promise.all(Object.entries(refMap).map(([ref, code]) => fetchLinkNome(ref, code)));
+    await ensureSenderData(txs);
 
     const recentes = txs.slice(0, limit).map(tx => {
       const sender = senderCache[tx.id] || {};
@@ -1738,7 +1798,7 @@ app.get('/api/pagbank/transacoes/recentes', async (req, res) => {
         data_br: tx.data ? tx.data.split('-').reverse().join('/') : 'N/A',
         nome: sender.nome || (tx.nome && tx.nome !== 'N/A' ? tx.nome : null),
         email: sender.email || (tx.email && tx.email !== 'N/A' ? tx.email : null),
-        descricao: linkNomeCache[tx.referencia] || tx.link_pagamento || null,
+        descricao: linkNomeCache[tx.referencia] || linkNomeCache['__tx__' + tx.id] || tx.link_pagamento || null,
         metodo: tx.metodo,
         parcelas,
         status: tx.status,
@@ -2526,10 +2586,11 @@ app.get('/api/clientes/kpis', async (req, res) => {
     const { inicio: inicioPBkpi, fim: fimPBkpi } = getPeriodoPagbank(req);
     const txsPBkpi = await pagbankListAllTx(inicioPBkpi, fimPBkpi);
 
-    // Buscar nomes/emails reais via fetchLinkNome (necessário para deduplicação correta)
+    // Buscar nomes/emails reais via fetchLinkNome + fallback para Text2Pay sem referencia
     const refMapKpi = {};
     txsPBkpi.forEach(tx => { if (tx.referencia && !refMapKpi[tx.referencia]) refMapKpi[tx.referencia] = tx.id; });
     await Promise.all(Object.entries(refMapKpi).map(([ref, code]) => fetchLinkNome(ref, code)));
+    await ensureSenderData(txsPBkpi);
 
     const emailsComSubKpi = new Set();
     for (const sub of activeSubs) {
@@ -2698,6 +2759,7 @@ app.get('/api/clientes/todos', async (req, res) => {
     const refMapTodos = {};
     txsPBtodos.forEach(tx => { if (tx.referencia && !refMapTodos[tx.referencia]) refMapTodos[tx.referencia] = tx.id; });
     await Promise.all(Object.entries(refMapTodos).map(([ref, code]) => fetchLinkNome(ref, code)));
+    await ensureSenderData(txsPBtodos);
 
     const emailToStripeId = {};
     for (const c of allCustomers) { if (c.email) emailToStripeId[c.email.toLowerCase()] = c.id; }
