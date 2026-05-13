@@ -3538,6 +3538,7 @@ app.get('/api/clientes/gestao', async (req, res) => {
   try {
     const mes = req.query.mes || mesAnoAtual();
     if (!/^\d{4}-\d{2}$/.test(mes)) return res.status(400).json({ error: 'Formato inválido. Use YYYY-MM' });
+    const apenasAtivos = req.query.apenas_ativos === 'true';
     const [ano, m] = mes.split('-').map(Number);
 
     // Timestamps do mês selecionado (para buscar invoices criadas no período)
@@ -3644,6 +3645,7 @@ app.get('/api/clientes/gestao', async (req, res) => {
       }
 
       // Implementação: usa dados manuais persistidos como fonte principal
+      const ativo = dadosManuais.ativo !== undefined ? dadosManuais.ativo : (!!match);
       const impl = dadosManuais.implementacao || {};
       const implementacao = {
         status: impl.status || 'nao_informado',
@@ -3656,6 +3658,7 @@ app.get('/api/clientes/gestao', async (req, res) => {
       return {
         ghl_id: locId,
         ghl_nome: nomeGHL,
+        ativo,
         stripe_customer_id: match ? match.id : null,
         stripe_email: match ? match.email : null,
         stripe_encontrado: !!match,
@@ -3675,23 +3678,28 @@ app.get('/api/clientes/gestao', async (req, res) => {
       };
     });
 
+    // Filtro de ativos (quando apenas_ativos=true, oculta subcontas não marcadas)
+    const clientesFiltrados = apenasAtivos ? clientes.filter(c => c.ativo) : clientes;
+
     // Ordena: Stripe encontrado primeiro, depois por nome
-    clientes.sort((a, b) => {
+    clientesFiltrados.sort((a, b) => {
       if (a.stripe_encontrado !== b.stripe_encontrado) return a.stripe_encontrado ? -1 : 1;
       return (a.ghl_nome || '').localeCompare(b.ghl_nome || '', 'pt-BR');
     });
 
-    const pagos    = clientes.filter(c => c.mensalidade?.status === 'pago').length;
-    const pendente = clientes.filter(c => ['pendente', 'em_atraso'].includes(c.mensalidade?.status)).length;
+    const pagos    = clientesFiltrados.filter(c => c.mensalidade?.status === 'pago').length;
+    const pendente = clientesFiltrados.filter(c => ['pendente', 'em_atraso'].includes(c.mensalidade?.status)).length;
 
     res.json({
       mes,
-      total: clientes.length,
-      com_stripe: clientes.filter(c => c.stripe_encontrado).length,
-      sem_stripe: clientes.filter(c => !c.stripe_encontrado).length,
+      apenas_ativos: apenasAtivos,
+      total: clientesFiltrados.length,
+      total_ghl: clientes.length,
+      com_stripe: clientesFiltrados.filter(c => c.stripe_encontrado).length,
+      sem_stripe: clientesFiltrados.filter(c => !c.stripe_encontrado).length,
       mensalidade_paga: pagos,
       mensalidade_pendente: pendente,
-      clientes,
+      clientes: clientesFiltrados,
       gerado_em: new Date().toISOString(),
     });
   } catch(err) { res.status(500).json({ error: err.message }); }
@@ -3876,6 +3884,94 @@ app.get('/api/clientes/gestao/:ghl_id/implementacao/detectar', async (req, res) 
       total_candidatos: candidatos.length,
       candidatos,
       nota: 'Use PATCH /api/clientes/gestao/' + ghl_id + '/implementacao para confirmar o status.',
+    });
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/clientes/gestao/importar-ativos
+// Recebe uma lista de nomes de empresas, faz fuzzy match contra todas as locations GHL
+// e marca as que bateram como ativo:true em clientesGestaoData.
+// Body: { nomes: ["Empresa A", "Empresa B", ...] }
+// Retorna: matches confirmados, não encontrados e scores
+app.post('/api/clientes/gestao/importar-ativos', async (req, res) => {
+  try {
+    const { nomes } = req.body || {};
+    if (!Array.isArray(nomes) || nomes.length === 0) {
+      return res.status(400).json({ error: 'body.nomes deve ser array de strings' });
+    }
+
+    const locations = await ghlGetAllLocations();
+
+    // Para cada nome da lista, tenta encontrar a melhor location
+    const confirmados = [];
+    const naoEncontrados = [];
+    const jaUsados = new Set();
+
+    for (const nomeOriginal of nomes) {
+      // Remove sufixo " - Nome Pessoa" comum na lista do usuário
+      const nomeLimpo = nomeOriginal.replace(/\s*[-–]\s*\w+\s*\w*$/, '').trim();
+      const nNorm = normStr(nomeLimpo);
+      const nWords = nNorm.split(/\s+/).filter(w => w.length >= 3);
+
+      let melhorScore = 0;
+      let melhorLoc = null;
+
+      for (const loc of locations) {
+        if (jaUsados.has(loc.id)) continue;
+        const locNorm = normStr(loc.name || '');
+
+        // Score 1: substring bidirecional
+        let score = 0;
+        if (locNorm.includes(nNorm) || nNorm.includes(locNorm)) {
+          score = Math.max(locNorm.length, nNorm.length) > 0
+            ? Math.min(locNorm.length, nNorm.length) / Math.max(locNorm.length, nNorm.length)
+            : 0;
+          score = Math.min(score + 0.3, 1); // bonus por substring
+        }
+
+        // Score 2: palavras em comum
+        const locWords = locNorm.split(/\s+/).filter(w => w.length >= 3);
+        const comum = nWords.filter(w => locWords.includes(w)).length;
+        const scoreWords = (nWords.length + locWords.length) > 0
+          ? (2 * comum) / (nWords.length + locWords.length)
+          : 0;
+
+        score = Math.max(score, scoreWords);
+
+        if (score > melhorScore) {
+          melhorScore = score;
+          melhorLoc = loc;
+        }
+      }
+
+      const LIMIAR = 0.25; // mínimo para considerar match
+      if (melhorLoc && melhorScore >= LIMIAR) {
+        jaUsados.add(melhorLoc.id);
+        // Marcar como ativo no storage
+        if (!clientesGestaoData[melhorLoc.id]) clientesGestaoData[melhorLoc.id] = {};
+        clientesGestaoData[melhorLoc.id].ativo = true;
+        confirmados.push({
+          nome_lista: nomeOriginal,
+          ghl_id: melhorLoc.id,
+          ghl_nome: melhorLoc.name,
+          score: parseFloat(melhorScore.toFixed(2)),
+        });
+      } else {
+        naoEncontrados.push({
+          nome_lista: nomeOriginal,
+          melhor_candidato: melhorLoc?.name || null,
+          score: parseFloat((melhorScore || 0).toFixed(2)),
+        });
+      }
+    }
+
+    saveGestaoData();
+    res.json({
+      total_lista: nomes.length,
+      confirmados: confirmados.length,
+      nao_encontrados: naoEncontrados.length,
+      matches: confirmados,
+      sem_match: naoEncontrados,
     });
   } catch(err) { res.status(500).json({ error: err.message }); }
 });
