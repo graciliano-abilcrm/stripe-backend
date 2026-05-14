@@ -935,10 +935,24 @@ app.get('/api/pagbank/saldo', async (req, res) => {
 app.get('/api/pagbank/volume', async (req, res) => {
   try {
     const { inicio, fim, inicioDate, fimDate } = getPeriodoPagbank(req);
-    const txs = await pagbankListAllTx(inicio, fim);
+
+    // a_receber deve sempre cobrir os últimos 60 dias (independente do filtro de período),
+    // pois transações parceladas de meses anteriores ainda estão "a liberar".
+    // Usar só o período atual subestimaria o valor real (como confirmado vs. app PagBank).
+    const agoraBRT = new Date(new Date().getTime() - 3 * 60 * 60 * 1000);
+    const inicio60BRT = new Date(agoraBRT.getTime() - 60 * 24 * 60 * 60 * 1000);
+    const toBRTStr = (d) => {
+      const pad = n => String(n).padStart(2, '0');
+      return d.getUTCFullYear() + '-' + pad(d.getUTCMonth()+1) + '-' + pad(d.getUTCDate()) + 'T' + pad(d.getUTCHours()) + ':' + pad(d.getUTCMinutes());
+    };
+
+    const [txs, txsPendentes60] = await Promise.all([
+      pagbankListAllTx(inicio, fim),
+      pagbankListAllTx(toBRTStr(inicio60BRT), toBRTStr(agoraBRT)),
+    ]);
+
     let pago = 0, pendente = 0, cancelado = 0, liquido = 0;
     let via_pix = 0, via_boleto = 0, via_cartao = 0, parcelado = 0;
-    let a_receber = 0; // status 'pago'(3) = aprovado mas ainda nao liberado ao vendedor
 
     for (const tx of txs) {
       const isAprovado = ['pago', 'disponivel'].includes(tx.status);
@@ -948,7 +962,6 @@ app.get('/api/pagbank/volume', async (req, res) => {
       if (isAprovado) {
         pago += tx.bruto;
         liquido += tx.liquido;
-        if (tx.status === 'pago') a_receber += tx.liquido; // aprovado mas nao creditado ainda
         if (tx.metodo === 'pix') via_pix += tx.bruto;
         else if (tx.metodo === 'boleto') via_boleto += tx.bruto;
         else if (tx.metodo === 'cartao' || tx.metodo === 'recorrente') {
@@ -962,6 +975,12 @@ app.get('/api/pagbank/volume', async (req, res) => {
       }
     }
 
+    // a_receber: soma dos últimos 60 dias com status 'pago' (aprovado, aguardando liberação)
+    let a_receber = 0;
+    for (const tx of txsPendentes60) {
+      if (tx.status === 'pago') a_receber += tx.liquido;
+    }
+
         const toPS = (d) => {
       const pad = (n) => String(n).padStart(2, '0');
       return d.getFullYear() + '-' + pad(d.getMonth()+1) + '-' + pad(d.getDate()) + 'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
@@ -973,6 +992,12 @@ app.get('/api/pagbank/volume', async (req, res) => {
     for (const tx of txsAnterior) {
       if (['pago', 'disponivel'].includes(tx.status)) periodo_anterior += tx.bruto;
     }
+    // ja_liberado = do período filtrado, quanto foi aprovado E já creditado (disponivel)
+    let ja_liberado = 0;
+    for (const tx of txs) {
+      if (tx.status === 'disponivel') ja_liberado += tx.liquido;
+    }
+
     res.json({
       pago: parseFloat(pago.toFixed(2)),
       liquido: parseFloat(liquido.toFixed(2)),
@@ -983,8 +1008,8 @@ app.get('/api/pagbank/volume', async (req, res) => {
       via_cartao: parseFloat(via_cartao.toFixed(2)),
       parcelado: parseFloat(parcelado.toFixed(2)),
       periodo_anterior: parseFloat(periodo_anterior.toFixed(2)),
-      a_receber: parseFloat(a_receber.toFixed(2)),
-      ja_liberado: parseFloat((liquido - a_receber).toFixed(2)),
+      a_receber: parseFloat(a_receber.toFixed(2)),         // últimos 60 dias, status 'pago'
+      ja_liberado: parseFloat(ja_liberado.toFixed(2)),     // período filtrado, status 'disponivel'
       taxas: parseFloat((pago - liquido).toFixed(2)),
       total_transacoes: txs.length,
     });
