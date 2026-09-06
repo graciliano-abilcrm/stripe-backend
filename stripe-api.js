@@ -4,6 +4,23 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 
+// Diretorio de dados. No Railway existe um volume montado em /data; sem ele o
+// container e efemero e TUDO que se grava morre no proximo deploy (foi o que
+// aconteceu com 193 registros de NF em 06/09/2026). Localmente cai em ./data.
+const DATA_DIR = (() => {
+  const candidatos = [process.env.DATA_DIR, '/data', path.join(__dirname, 'data')].filter(Boolean);
+  for (const dir of candidatos) {
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      fs.accessSync(dir, fs.constants.W_OK);
+      return dir;
+    } catch (e) { /* tenta o proximo */ }
+  }
+  return __dirname;
+})();
+const dataFile = (nome) => path.join(DATA_DIR, nome);
+console.log('[dados] gravando em ' + DATA_DIR + (DATA_DIR === '/data' ? ' (volume persistente)' : ' (ATENCAO: sem volume, dados somem no deploy)'));
+
 const app = express();const PORT = process.env.PORT || 3001;
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
 
@@ -36,7 +53,14 @@ async function stripeListAll(endpoint, params = {}) {
   let hasMore = true;
   let startingAfter = null;
   while (hasMore) {
-    const queryParams = new URLSearchParams({ limit: '100', ...params });
+    // Valor array vira parametro repetido (expand[]=a&expand[]=b). Com
+    // URLSearchParams({...}) os multiplos expand da Stripe viravam "a,b" e ela ignora.
+    const queryParams = new URLSearchParams();
+    queryParams.set('limit', '100');
+    for (const [k, v] of Object.entries(params)) {
+      if (Array.isArray(v)) v.forEach((item) => queryParams.append(k, item));
+      else queryParams.set(k, v);
+    }
     if (startingAfter) queryParams.set('starting_after', startingAfter);
     const result = await stripeRequest(`/v1/${endpoint}?${queryParams}`);
     if (result.error) throw new Error(result.error.message);
@@ -517,50 +541,130 @@ app.get('/api/stripe/payouts-total', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ============================================================================
+// CHEGADA NO BANCO (Stripe) — diferente de liberacao de saldo
+//
+// Conta BR com schedule daily / delay_days 30: o dinheiro que fica disponivel
+// no dia D e repassado no PROXIMO DIA UTIL. Validado contra 14 dias de
+// historico: 29/08 (sab) 661,74 + 30/08 (dom) 308,08 + 31/08 (seg) 2.075,12 =
+// 3.044,94, e o repasse pago em 31/08 foi 3.040,52.
+//
+// Payout ja criado tem arrival_date exato e manda: e fato, nao projecao.
+// Para nao contar duas vezes, so projetamos datas POSTERIORES a ultima chegada
+// ja confirmada — o que veio antes disso ja esta dentro daqueles payouts.
+// ============================================================================
+
+function proximoDiaUtil(dataStr) {
+  const d = new Date(dataStr + 'T12:00:00Z');
+  while (d.getUTCDay() === 0 || d.getUTCDay() === 6) d.setUTCDate(d.getUTCDate() + 1);
+  return d.toISOString().substring(0, 10);
+}
+
+async function stripeChegadasNoBanco() {
+  const [emRota, ag, saldo] = await Promise.all([
+    stripePayoutsEmRota(),
+    stripeAgendaLiberacao(),
+    stripeRequest('/v1/balance'),
+  ]);
+
+  const porData = {};
+  const add = (data, valor, tipo) => {
+    if (!porData[data]) porData[data] = { data, valor: 0, tipo, confirmado: 0, projetado: 0 };
+    porData[data].valor = round(porData[data].valor + valor);
+    porData[data][tipo] = round(porData[data][tipo] + valor);
+    if (porData[data].confirmado > 0) porData[data].tipo = 'confirmado';
+  };
+
+  // 1) repasses ja criados — data e valor exatos
+  emRota.forEach((p) => add(p.data_chegada, p.valor, 'confirmado'));
+  const ultimaConfirmada = emRota.length ? emRota[emRota.length - 1].data_chegada : null;
+
+  // 2) saldo disponivel parado cai no proximo dia util, se ainda nao houver
+  //    payout confirmado cobrindo esse dia
+  const disponivel = round(((saldo.available || []).reduce((s, b) => s + b.amount, 0)) / 100);
+  const hoje = HOJE_BRT();
+  let disponivelIncluido = false;
+  if (disponivel > 0) {
+    const quando = proximoDiaUtil(hoje);
+    // Se ja existe payout criado chegando depois, esse saldo esta dentro dele.
+    if (!ultimaConfirmada || quando > ultimaConfirmada) {
+      add(quando, disponivel, 'projetado');
+      disponivelIncluido = true;
+    }
+  }
+
+  // 3) o que ainda vai liberar: chega no proximo dia util do available_on
+  ag.por_data.forEach(({ data, valor }) => {
+    if (ultimaConfirmada && data <= ultimaConfirmada) return; // ja dentro de um payout criado
+    if (valor <= 0) return;
+    add(proximoDiaUtil(data), valor, 'projetado');
+  });
+
+  const lista = Object.values(porData)
+    .sort((a, b) => a.data.localeCompare(b.data))
+    .map((d) => ({ ...d, data_br: d.data.split('-').reverse().join('/') }));
+
+  return {
+    chegadas: lista,
+    total: round(lista.reduce((a, d) => a + d.valor, 0)),
+    total_confirmado: round(emRota.reduce((a, p) => a + p.valor, 0)),
+    proxima: lista[0] || null,
+    disponivel_parado: disponivel,
+    // false = esse saldo JA esta dentro de um repasse confirmado; somar de novo
+    // conta em dobro. total sempre e o numero bom de usar.
+    disponivel_incluido_no_total: disponivelIncluido,
+  };
+}
+
 // GET /api/stripe/repasses/projecao
 app.get('/api/stripe/repasses/projecao', async (req, res) => {
   try {
-    const btxns = await stripeListAll('balance_transactions', { type: 'charge' });
-    const pending = btxns.filter(t => t.status === 'pending');
-    const a_receber_total = pending.reduce((sum, t) => sum + t.net, 0) / 100;
+    // ESTE endpoint responde "quando cai no banco" (repasse), nao "quando libera
+    // o saldo". Sao datas diferentes: o repasse que chega 08/09 carrega saldo que
+    // ficou disponivel dias antes. Misturar os dois fazia o card de repasse
+    // semanal mostrar menos do que a propria Stripe anunciava para terca-feira.
+    const [chg, ag] = await Promise.all([stripeChegadasNoBanco(), stripeAgendaLiberacao()]);
 
-    // Group by week of projected payout date (created + 15 days)
     const weekMap = {};
-    pending.forEach(t => {
-      const payoutDate = new Date((t.created + 15 * 86400) * 1000);
-      // Get start of week (Monday)
-      const day = payoutDate.getDay();
-      const diff = (day === 0 ? -6 : 1 - day);
-      const weekStart = new Date(payoutDate);
-      weekStart.setDate(payoutDate.getDate() + diff);
-      weekStart.setHours(0, 0, 0, 0);
-      const weekEnd = new Date(weekStart);
-      weekEnd.setDate(weekStart.getDate() + 6);
-
-      const fmt = (d) => d.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' });
-      const key = 'Semana de ' + fmt(weekStart) + ' a ' + fmt(weekEnd);
-      if (!weekMap[key]) weekMap[key] = { semana: key, valor_previsto: 0, quantidade: 0, _sort: weekStart.getTime() };
-      weekMap[key].valor_previsto += t.net / 100;
+    chg.chegadas.forEach(({ data, valor }) => {
+      const d = new Date(data + 'T12:00:00Z');
+      const dow = d.getUTCDay();
+      const ini = new Date(d.getTime() + (dow === 0 ? -6 : 1 - dow) * 86400000);
+      const fimSem = new Date(ini.getTime() + 6 * 86400000);
+      const fmt = (x) => String(x.getUTCDate()).padStart(2, '0') + '/' + String(x.getUTCMonth() + 1).padStart(2, '0');
+      const key = 'Semana de ' + fmt(ini) + ' a ' + fmt(fimSem);
+      if (!weekMap[key]) weekMap[key] = { semana: key, valor_previsto: 0, quantidade: 0, _sort: ini.getTime() };
+      weekMap[key].valor_previsto = round(weekMap[key].valor_previsto + valor);
       weekMap[key].quantidade += 1;
     });
 
     const projecao = Object.values(weekMap)
       .sort((a, b) => a._sort - b._sort)
-      .map(({ _sort, ...rest }) => ({ ...rest, valor_previsto: parseFloat(rest.valor_previsto.toFixed(2)) }));
-
-    // Next payout = earliest week
-    let proximo_repasse = { data_prevista: 'N/A', valor: 0 };
-    if (projecao.length > 0) {
-      proximo_repasse = {
-        data_prevista: projecao[0].semana,
-        valor: projecao[0].valor_previsto
-      };
-    }
+      .map(({ _sort, ...rest }) => rest);
 
     res.json({
-      a_receber_total: parseFloat(a_receber_total.toFixed(2)),
+      a_receber_total: ag.total,
       projecao,
-      proximo_repasse
+      // o proximo repasse e o payout REAL com data de chegada, nao um balde semanal
+      proximo_repasse: chg.proxima
+        ? {
+            data_prevista: chg.proxima.data_br,
+            data: chg.proxima.data,
+            valor: chg.proxima.valor,
+            confirmado: chg.proxima.tipo === 'confirmado',
+          }
+        : { data_prevista: 'N/A', valor: 0, confirmado: false },
+      // chegada no banco, dia a dia: `confirmado` = payout ja criado na Stripe,
+      // `projetado` = saldo que ainda vira repasse no proximo dia util
+      chegadas: chg.chegadas,
+      total_a_chegar: chg.total,
+      total_confirmado: chg.total_confirmado,
+      disponivel_parado: chg.disponivel_parado,
+      disponivel_incluido_no_total: chg.disponivel_incluido_no_total,
+      // liberacao de saldo (available_on) — outra pergunta, outro numero
+      por_data: ag.por_data.map((d) => ({ ...d, data_br: d.data.split('-').reverse().join('/') })),
+      proxima_liberacao: ag.por_data[0] || null,
+      fonte: 'payouts.arrival_date (confirmado) + available_on no proximo dia util (projetado)',
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -803,7 +907,7 @@ function enrichTx(tx) {
     tipo:                 classifyTipo(linkDesc, tx.bruto, tx.metodo, 'pagbank'),
     parcelas,
     valor_liquido:        tx.liquido,
-    previsao_recebimento: calcPrevisaoRecebimento(tx.data, tx.metodo, parcelas, tx.status, 'pagbank'),
+    previsao_recebimento: previsaoPagbank(tx, parcelas, tx.status),
   };
 }
 
@@ -834,6 +938,43 @@ function parseTx(txXml) {
     link_pagamento: itemMatch ? xmlVal(itemMatch[1], 'description') || null : null,
     plataforma: 'pagbank',
   };
+}
+
+// Previsao de uma transacao PagBank: usa a escrowEndDate real quando ja
+// conhecida (cache de detalhes) e so cai na heuristica quando nao ha.
+// `fonte` diz qual das duas foi usada, para a tela nao apresentar chute como
+// se fosse dado oficial.
+// Idem para Stripe: available_on da balance_transaction e a data exata.
+function previsaoStripe(bt, dataStr, metodo, parcelas, statusStr) {
+  if (bt && bt.available_on) {
+    const dia = (s) => new Date(s + 'T12:00:00Z').getTime();
+    const data = new Date(bt.available_on * 1000).toISOString().substring(0, 10);
+    const dias = Math.round((dia(data) - dia(HOJE_BRT())) / 86400000);
+    return {
+      data_prevista: data,
+      dias_restantes: Math.max(0, dias),
+      ja_disponivel: bt.status === 'available' || dias <= 0,
+      fonte: 'available_on',
+    };
+  }
+  const est = calcPrevisaoRecebimento(dataStr, metodo, parcelas, statusStr, 'stripe');
+  return est ? { ...est, fonte: 'estimado' } : null;
+}
+
+function previsaoPagbank(tx, parcelas, statusStr) {
+  const det = pbDetalheCache.get(tx.id);
+  if (det && det.data_liberacao) {
+    const dia = (s) => new Date(s + 'T12:00:00Z').getTime();
+    const dias = Math.round((dia(det.data_liberacao) - dia(HOJE_BRT())) / 86400000);
+    return {
+      data_prevista: det.data_liberacao,
+      dias_restantes: Math.max(0, dias),
+      ja_disponivel: dias <= 0,
+      fonte: 'escrowEndDate',
+    };
+  }
+  const est = calcPrevisaoRecebimento(tx.data, tx.metodo, parcelas, statusStr, 'pagbank');
+  return est ? { ...est, fonte: 'estimado' } : null;
 }
 
 function calcPrevisaoRecebimento(dataStr, metodo, parcelas, status, plataforma) {
@@ -909,25 +1050,26 @@ async function pagbankListAllTx(initialDate, finalDate) {
   return all;
 }
 
-// GET /api/pagbank/saldo — Legacy API (ws.pagseguro.uol.com.br)
+// GET /api/pagbank/saldo
+// Nenhuma das duas APIs entrega o saldo com a credencial atual:
+//   ws.pagseguro.uol.com.br/v2/balance  -> 404 (rota nao existe)
+//   api.pagseguro.com/accounts/balance  -> 403 (token sem permissao no recurso)
+// O "a liberar", porem, da para calcular com precisao pela escrowEndDate.
+// NUNCA devolver o corpo cru do PagBank: a pagina de erro dele ecoa a URL da
+// requisicao, que carrega email= e token= na querystring.
 app.get('/api/pagbank/saldo', async (req, res) => {
   try {
-    const result = await pagbankLegacyRequest('/v2/balance');
-    const xml = result._body;
-    if (result._status === 200 && xml.includes('<balance>')) {
-      const availableMatch = xml.match(/<available[^>]*>([\s\S]*?)<\/available>/);
-      const releasingMatch = xml.match(/<releasing[^>]*>([\s\S]*?)<\/releasing>/);
-      const disponivel = availableMatch ? parseFloat(xmlVal(availableMatch[1], 'value') || '0') : 0;
-      const a_liberar = releasingMatch ? parseFloat(xmlVal(releasingMatch[1], 'value') || '0') : 0;
-      res.json({
-        disponivel: parseFloat(disponivel.toFixed(2)),
-        a_liberar: parseFloat(a_liberar.toFixed(2)),
-        total: parseFloat((disponivel + a_liberar).toFixed(2)),
-        moeda: 'BRL'
-      });
-    } else {
-      res.json({ disponivel: null, a_liberar: null, total: null, moeda: 'BRL', nota: 'Saldo indisponivel - status ' + result._status + ' - ' + xml.substring(0, 200) });
-    }
+    const ag = await pagbankAgendaLiberacao();
+    res.json({
+      disponivel: null,
+      a_liberar: ag.total,
+      total: null,
+      moeda: 'BRL',
+      nota: 'Saldo disponivel nao acessivel com o token atual; "a liberar" calculado por escrowEndDate',
+      disponivel_motivo: 'PagBank nega /accounts/balance para este token (403)',
+      a_liberar_fonte: 'escrowEndDate (detalhe da transacao)',
+      a_liberar_por_data: ag.por_data.map((d) => ({ ...d, data_br: d.data.split('-').reverse().join('/') })),
+    });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -1040,62 +1182,283 @@ app.get('/api/pagbank/transacoes', async (req, res) => {
 // Prazos: PIX D+1, Boleto D+2, Cartão D+30
 app.get('/api/pagbank/repasses/projecao', async (req, res) => {
   try {
-    // Busca últimos 90 dias para pegar tudo "a liberar" (status pago = aprovado não liberado)
-    const agora = new Date();
-    const brt = (d) => new Date(d.getTime() - 3 * 60 * 60 * 1000);
-    const pad = (n) => String(n).padStart(2, '0');
-    const toPS = (d) => {
-      const b = brt(d);
-      return b.getFullYear() + '-' + pad(b.getMonth()+1) + '-' + pad(b.getDate()) + 'T' + pad(b.getHours()) + ':' + pad(b.getMinutes());
-    };
-    const inicio90 = new Date(agora.getTime() - 90 * 24 * 60 * 60 * 1000);
-    const txs = await pagbankListAllTx(toPS(inicio90), toPS(new Date(agora.getTime() - 2 * 60 * 1000)));
-
-    // Apenas transações aprovadas mas ainda não liberadas (status 'pago' = code 3)
-    const pendentes = txs.filter(tx => tx.status === 'pago');
-
-    // Prazo de liberação por método (dias corridos)
-    const prazoMap = { pix: 1, boleto: 2, cartao: 30, recorrente: 30, debito: 1, saldo: 0, outro: 2 };
+    // escrowEndDate = data real de liberacao (vem do detalhe da transacao).
+    // Substitui o prazoMap por metodo, que contradizia calcPrevisaoRecebimento.
+    const ag = await pagbankAgendaLiberacao();
 
     const weekMap = {};
-    let a_liberar_total = 0;
-
-    pendentes.forEach(tx => {
-      a_liberar_total += tx.liquido;
-      const prazo = prazoMap[tx.metodo] ?? 2;
-      const dataBase = new Date(tx.data + 'T12:00:00');
-      const liberacao = new Date(dataBase.getTime() + prazo * 24 * 60 * 60 * 1000);
-
-      // Início da semana (segunda-feira)
-      const day = liberacao.getDay();
-      const diff = (day === 0 ? -6 : 1 - day);
-      const weekStart = new Date(liberacao);
-      weekStart.setDate(liberacao.getDate() + diff);
-      weekStart.setHours(0, 0, 0, 0);
-      const weekEnd = new Date(weekStart);
-      weekEnd.setDate(weekStart.getDate() + 6);
-
-      const fmt = (d) => d.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' });
-      const key = 'Semana de ' + fmt(weekStart) + ' a ' + fmt(weekEnd);
-      if (!weekMap[key]) weekMap[key] = { semana: key, valor_previsto: 0, quantidade: 0, _sort: weekStart.getTime() };
-      weekMap[key].valor_previsto += tx.liquido;
+    ag.por_data.forEach(({ data, valor }) => {
+      const d = new Date(data + 'T12:00:00Z');
+      const dow = d.getUTCDay();
+      const ini = new Date(d.getTime() + (dow === 0 ? -6 : 1 - dow) * 86400000);
+      const fimSem = new Date(ini.getTime() + 6 * 86400000);
+      const fmt = (x) => String(x.getUTCDate()).padStart(2, '0') + '/' + String(x.getUTCMonth() + 1).padStart(2, '0');
+      const key = 'Semana de ' + fmt(ini) + ' a ' + fmt(fimSem);
+      if (!weekMap[key]) weekMap[key] = { semana: key, valor_previsto: 0, quantidade: 0, _sort: ini.getTime() };
+      weekMap[key].valor_previsto = round(weekMap[key].valor_previsto + valor);
       weekMap[key].quantidade += 1;
     });
 
     const projecao = Object.values(weekMap)
       .sort((a, b) => a._sort - b._sort)
-      .map(({ _sort, ...rest }) => ({ ...rest, valor_previsto: parseFloat(rest.valor_previsto.toFixed(2)) }));
-
-    const proximo_repasse = projecao.length > 0
-      ? { data_prevista: projecao[0].semana, valor: projecao[0].valor_previsto }
-      : { data_prevista: 'N/A', valor: 0 };
+      .map(({ _sort, ...rest }) => rest);
 
     res.json({
-      a_liberar_total: parseFloat(a_liberar_total.toFixed(2)),
+      a_liberar_total: ag.total,
       projecao,
-      proximo_repasse,
+      proximo_repasse: projecao.length
+        ? { data_prevista: projecao[0].semana, valor: projecao[0].valor_previsto }
+        : { data_prevista: 'N/A', valor: 0 },
+      por_data: ag.por_data.map((d) => ({ ...d, data_br: d.data.split('-').reverse().join('/') })),
+      proxima_liberacao: ag.por_data[0] || null,
+      estimados: ag.estimados,
+      fonte: 'escrowEndDate (detalhe da transacao)',
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ============================================================================
+// VINCULO DE SUBCONTA E CORRECAO DE TIPO
+//
+// A subconta NAO precisa sair de regex na descricao: a Stripe manda o id da
+// location GHL em metadata.entityId (recarga de carteira, entityType=LOCATION)
+// e em metadata.locationId (assinatura SaaS). Medido em 100 cobrancas: 85%
+// resolvem por id exato, zero orfaos. O resto cai em nome do cliente e, por
+// ultimo, em vinculo manual.
+//
+// `subconta_fonte` viaja junto para a tela nao mostrar palpite fuzzy com a
+// mesma confianca de um id exato.
+// ============================================================================
+
+const VINCULOS_FILE = dataFile('vinculos-subconta.json');
+const TIPO_FILE = dataFile('tipo-overrides.json');
+
+const lerJson = (arquivo, padrao) => {
+  try { if (fs.existsSync(arquivo)) return JSON.parse(fs.readFileSync(arquivo, 'utf8')); }
+  catch (e) { console.error('[dados] falha lendo ' + arquivo + ': ' + e.message); }
+  return padrao;
+};
+const gravarJson = (arquivo, valor) => {
+  try { fs.writeFileSync(arquivo, JSON.stringify(valor, null, 2)); return true; }
+  catch (e) { console.error('[dados] falha gravando ' + arquivo + ': ' + e.message); return false; }
+};
+
+// { "stripe:cus_x" | "pagbank:TXID" | "email:x@y" | "nome:acme": {subconta_id, subconta_nome, ...} }
+let vinculos = lerJson(VINCULOS_FILE, {});
+// { regras: { "email:x@y": {tipo} }, transacoes: { "TXID": {tipo} } }
+let tipoOverrides = lerJson(TIPO_FILE, { regras: {}, transacoes: {} });
+if (!tipoOverrides.regras) tipoOverrides.regras = {};
+if (!tipoOverrides.transacoes) tipoOverrides.transacoes = {};
+
+const TIPOS_VALIDOS = ['assinatura', 'variavel', 'implementacao', 'implementacao_basica',
+  'implementacao_personalizada', 'implementacao_avancada'];
+
+// O PagBank devolve nomes com lixo concatenado na origem — existe cadastro
+// gravado como "DIVINAL DISTR DE VIDROS NACIONAL LTDA undefined". Sem limpar,
+// o nome nunca casa com a subconta nem com uma regra salva.
+const limparNome = (n) => (n || '')
+  .replace(/\s+(undefined|null|NaN)\s*$/i, '')
+  .replace(/\s+/g, ' ')
+  .trim() || null;
+
+const chaveNome = (n) => 'nome:' + normalizeName(limparNome(n)).replace(/\s/g, '');
+const chaveEmail = (e) => 'email:' + (e || '').toLowerCase().trim();
+const chaveSubconta = (id) => 'subconta:' + id;
+
+// Indice de locations com TTL — 436 subcontas, nao da pra buscar a cada pagamento
+let locIdx = { em: 0, porId: {}, lista: [] };
+async function ghlLocationsIndex() {
+  if (locIdx.lista.length && Date.now() - locIdx.em < 10 * 60 * 1000) return locIdx;
+  const lista = await ghlGetAllLocations();
+  const porId = {};
+  lista.forEach((l) => { if (l.id) porId[l.id] = l.name || ''; });
+  locIdx = { em: Date.now(), porId, lista };
+  return locIdx;
+}
+
+// Dominios de provedor nao dizem nada sobre a empresa. abilcrm.com entra na
+// lista porque generico@abilcrm.com e o e-mail interno usado em varias vendas.
+const DOMINIOS_GENERICOS = new Set(['gmail.com', 'hotmail.com', 'outlook.com', 'outlook.com.br',
+  'yahoo.com', 'yahoo.com.br', 'icloud.com', 'bol.com.br', 'uol.com.br', 'terra.com.br',
+  'live.com', 'msn.com', 'me.com', 'globo.com', 'abilcrm.com']);
+
+// "financeiro.lj@linuspauling.com.br" -> "linuspauling"
+function raizDominio(email) {
+  const dom = (email || '').split('@')[1];
+  if (!dom) return null;
+  const d = dom.toLowerCase().trim();
+  if (DOMINIOS_GENERICOS.has(d)) return null;
+  return d.split('.')[0].replace(/[^a-z0-9]/g, '') || null;
+}
+
+// Cobranca de verificacao de cartao (3DS) nao pertence a subconta nenhuma —
+// e validacao de meio de pagamento, nao venda. Marcar como nao aplicavel evita
+// que ela conte como "falha de identificacao".
+const ehVerificacaoCartao = (desc) =>
+  /3ds|verifica(c|ç)(a|ã)o|add new card|adicionar novo cart(a|ã)o/i.test(desc || '');
+
+// Ordem: vinculo manual > id exato do metadata > regex da descricao >
+//        dominio do e-mail > nome do cliente
+function resolverSubconta(idx, { metadata, descricao, nome, email, customerId, txId }) {
+  const vinculoDe = (k) => (k && vinculos[k] ? vinculos[k] : null);
+  const manual = vinculoDe(customerId ? 'stripe:' + customerId : null)
+    || vinculoDe(txId ? 'pagbank:' + txId : null)
+    || vinculoDe(email ? chaveEmail(email) : null)
+    || vinculoDe(nome ? chaveNome(nome) : null);
+  if (manual) {
+    return { subconta_id: manual.subconta_id, subconta: manual.subconta_nome || idx.porId[manual.subconta_id] || '', subconta_fonte: 'manual' };
+  }
+  // Vinculo feito na tela de cruzamento (store antigo, por customer da Stripe).
+  // Ler os dois evita que a mesma subconta precise ser vinculada duas vezes.
+  const antigo = customerId ? manualMappings[customerId] : null;
+  if (antigo && antigo.ghl_location_id) {
+    return {
+      subconta_id: antigo.ghl_location_id,
+      subconta: antigo.ghl_nome || idx.porId[antigo.ghl_location_id] || '',
+      subconta_fonte: 'manual',
+    };
+  }
+
+  const m = metadata || {};
+  const idExato = (String(m.entityType || '').toUpperCase() === 'LOCATION' && m.entityId) ? m.entityId : (m.locationId || null);
+  if (idExato && idx.porId[idExato]) {
+    return { subconta_id: idExato, subconta: idx.porId[idExato], subconta_fonte: 'metadata' };
+  }
+
+  const viaDesc = (descricao || '').match(/Auto-Recharge for Sub-Account - (.+?) (?:of BRL|\d)/);
+  if (viaDesc) {
+    const alvo = viaDesc[1].trim();
+    const hit = idx.lista.find((l) => normalizeName(l.name) === normalizeName(alvo));
+    return { subconta_id: hit ? hit.id : null, subconta: hit ? hit.name : alvo, subconta_fonte: hit ? 'descricao' : 'descricao_sem_id' };
+  }
+
+  // Dominio proprio e evidencia mais forte que nome parecido: "Carolina Bianchi
+  // Linus" nao casa com "Centro Educacional Linus Pauling", mas
+  // @linuspauling.com.br casa.
+  const raiz = raizDominio(email);
+  if (raiz && raiz.length >= 4) {
+    let hit = idx.lista.find((l) => l.email && raizDominio(l.email) === raiz);
+    if (!hit) {
+      hit = idx.lista.find((l) => {
+        const n = normalizeName(l.name).replace(/\s/g, '');
+        return n.length >= 4 && (n.includes(raiz) || raiz.includes(n));
+      });
+    }
+    if (hit) return { subconta_id: hit.id, subconta: hit.name, subconta_fonte: 'email' };
+  }
+
+  if (nome) {
+    const hit = idx.lista.find((l) => nomesSimilares(l.name, nome));
+    if (hit) return { subconta_id: hit.id, subconta: hit.name, subconta_fonte: 'nome' };
+  }
+  if (ehVerificacaoCartao(descricao)) {
+    return { subconta_id: null, subconta: '', subconta_fonte: 'nao_aplicavel' };
+  }
+  return { subconta_id: null, subconta: '', subconta_fonte: 'nao_identificado' };
+}
+
+// Tipo com override: transacao avulsa vence regra por cliente, que vence heuristica.
+// Para Stripe, a linha da invoice ("1 x Abil CRM (at R$ 1.200,00 / month)") prova
+// que e mensalidade — sem isso "Subscription update" caia em 'variavel'.
+function resolverTipo({ txId, email, nome, descricao, valor, metodo, plataforma, invoiceDesc, subcontaId }) {
+  const avulso = txId && tipoOverrides.transacoes[txId];
+  if (avulso) return { tipo: avulso.tipo, tipo_fonte: 'manual_transacao' };
+
+  // subconta primeiro: e a identidade estavel do cliente. Nome muda, e-mail do
+  // pagador muda, a subconta nao.
+  const regra = (subcontaId && tipoOverrides.regras[chaveSubconta(subcontaId)])
+    || (email && tipoOverrides.regras[chaveEmail(email)])
+    || (nome && tipoOverrides.regras[chaveNome(nome)]);
+  if (regra) return { tipo: regra.tipo, tipo_fonte: 'manual_cliente' };
+
+  if (invoiceDesc && /\/\s*(month|mês|mes|year|ano)/i.test(invoiceDesc)) {
+    return { tipo: 'assinatura', tipo_fonte: 'invoice' };
+  }
+  return { tipo: classifyTipo(descricao, valor, metodo, plataforma), tipo_fonte: 'heuristica' };
+}
+
+// GET /api/vinculos — vinculos manuais de subconta (Stripe e PagBank)
+app.get('/api/vinculos', (req, res) => {
+  res.json({ total: Object.keys(vinculos).length, vinculos });
+});
+
+// POST /api/vinculos — cria/atualiza um vinculo
+// Body: { chave, subconta_id, subconta_nome?, origem_nome? }
+//   chave: "stripe:<customer_id>" | "pagbank:<tx_id>" | "email:<email>" | "nome:<nome>"
+app.post('/api/vinculos', express.json(), async (req, res) => {
+  const { chave, subconta_id, subconta_nome, origem_nome } = req.body || {};
+  if (!chave || !subconta_id) return res.status(400).json({ error: 'chave e subconta_id sao obrigatorios' });
+  if (!/^(stripe|pagbank|email|nome):.+/.test(chave)) {
+    return res.status(400).json({ error: 'chave deve comecar com stripe:, pagbank:, email: ou nome:' });
+  }
+  const idx = await ghlLocationsIndex();
+  if (!idx.porId[subconta_id]) return res.status(400).json({ error: 'subconta_id nao existe na agencia' });
+  vinculos[chave] = {
+    subconta_id,
+    subconta_nome: subconta_nome || idx.porId[subconta_id],
+    origem_nome: origem_nome || '',
+    criado_em: new Date().toISOString(),
+  };
+  gravarJson(VINCULOS_FILE, vinculos);
+  res.json({ ok: true, chave, vinculo: vinculos[chave] });
+});
+
+// DELETE /api/vinculos?chave=...
+app.delete('/api/vinculos', (req, res) => {
+  const chave = req.query.chave;
+  if (!chave || !vinculos[chave]) return res.status(404).json({ error: 'vinculo nao encontrado' });
+  delete vinculos[chave];
+  gravarJson(VINCULOS_FILE, vinculos);
+  res.json({ ok: true, removido: chave });
+});
+
+// GET /api/tipo-overrides — correcoes manuais de tipo
+app.get('/api/tipo-overrides', (req, res) => {
+  res.json({
+    regras: tipoOverrides.regras,
+    transacoes: tipoOverrides.transacoes,
+    total_regras: Object.keys(tipoOverrides.regras).length,
+    total_transacoes: Object.keys(tipoOverrides.transacoes).length,
+    tipos_validos: TIPOS_VALIDOS,
+  });
+});
+
+// POST /api/tipo-overrides — Body: { tipo, escopo: 'cliente'|'transacao', email?|nome?|tx_id?, nota? }
+// escopo 'cliente' vale para todo pagamento futuro daquele cliente (caso Divinal,
+// que paga a mensalidade por boleto todo mes e caia em implementacao).
+app.post('/api/tipo-overrides', express.json(), (req, res) => {
+  const { tipo, escopo, email, nome, tx_id, nota } = req.body || {};
+  if (!TIPOS_VALIDOS.includes(tipo)) return res.status(400).json({ error: 'tipo invalido', tipos_validos: TIPOS_VALIDOS });
+  const registro = { tipo, nota: nota || '', criado_em: new Date().toISOString() };
+
+  if (escopo === 'transacao') {
+    if (!tx_id) return res.status(400).json({ error: 'tx_id obrigatorio para escopo transacao' });
+    tipoOverrides.transacoes[tx_id] = registro;
+    gravarJson(TIPO_FILE, tipoOverrides);
+    return res.json({ ok: true, escopo, chave: tx_id, override: registro });
+  }
+  if (escopo === 'cliente') {
+    const { subconta_id } = req.body || {};
+    if (!subconta_id && !email && !nome) {
+      return res.status(400).json({ error: 'subconta_id, email ou nome obrigatorio para escopo cliente' });
+    }
+    // subconta_id e a chave preferida: sobrevive a mudanca de nome e de pagador
+    const chave = subconta_id ? chaveSubconta(subconta_id) : (email ? chaveEmail(email) : chaveNome(nome));
+    tipoOverrides.regras[chave] = { ...registro, origem_nome: nome || '', origem_email: email || '', subconta_id: subconta_id || null };
+    gravarJson(TIPO_FILE, tipoOverrides);
+    return res.json({ ok: true, escopo, chave, override: tipoOverrides.regras[chave] });
+  }
+  res.status(400).json({ error: "escopo deve ser 'cliente' ou 'transacao'" });
+});
+
+// DELETE /api/tipo-overrides?escopo=cliente|transacao&chave=...
+app.delete('/api/tipo-overrides', (req, res) => {
+  const { escopo, chave } = req.query;
+  const alvo = escopo === 'transacao' ? tipoOverrides.transacoes : tipoOverrides.regras;
+  if (!chave || !alvo[chave]) return res.status(404).json({ error: 'override nao encontrado' });
+  delete alvo[chave];
+  gravarJson(TIPO_FILE, tipoOverrides);
+  res.json({ ok: true, removido: chave, escopo });
 });
 
 // GET /api/pagamentos — pagamentos unificados Stripe + PagBank
@@ -1104,13 +1467,17 @@ app.get('/api/pagamentos', async (req, res) => {
     const { inicio, fim } = getPeriodo(req);
     const { inicio: inicioPB, fim: fimPB } = getPeriodoPagbank(req);
 
-    const [charges, txsPagbank] = await Promise.all([
+    const [charges, txsPagbank, locIndex] = await Promise.all([
       stripeListAll('charges', {
         'created[gte]': String(inicio), 'created[lte]': String(fim),
-        'expand[]': 'data.balance_transaction',
+        'expand[]': ['data.balance_transaction', 'data.invoice', 'data.customer'],
       }),
       pagbankListAllTx(inicioPB, fimPB),
+      ghlLocationsIndex(),
     ]);
+
+    // aquece o cache de detalhes para previsao_recebimento sair com data real
+    await pagbankAgendaLiberacao().catch(() => {});
 
     const stripe = charges.map(c => {
       const match = c.description?.match(/Auto-Recharge for Sub-Account - (.+?) (?:of BRL|\d)/);
@@ -1123,26 +1490,44 @@ app.get('/api/pagamentos', async (req, res) => {
       const parcelas = pm?.card?.installments?.plan?.count || 1;
       const dataStr = new Date(c.created * 1000).toISOString().substring(0, 10);
       const statusStr = c.status === 'succeeded' ? 'aprovado' : c.status === 'failed' ? 'falhou' : c.status;
+      const inv = c.invoice && typeof c.invoice === 'object' ? c.invoice : null;
+      const invoiceDesc = inv?.lines?.data?.[0]?.description || null;
+      const nomeCli = limparNome(c.billing_details?.name || (typeof c.customer === 'object' ? c.customer?.name : null));
+      const emailCli = c.billing_details?.email || (typeof c.customer === 'object' ? c.customer?.email : null) || null;
+      const sub = resolverSubconta(locIndex, {
+        metadata: c.metadata, descricao: c.description, nome: nomeCli, email: emailCli,
+        customerId: typeof c.customer === 'string' ? c.customer : c.customer?.id,
+      });
+      const tp = resolverTipo({
+        txId: c.id, email: emailCli, nome: nomeCli, descricao: c.description,
+        valor, metodo: c.invoice ? 'recorrente' : metodo, plataforma: 'stripe', invoiceDesc,
+        subcontaId: sub.subconta_id,
+      });
       return {
         id: c.id,
         plataforma: 'stripe',
         valor,
         valor_liquido,
         taxa,
-        nome: c.billing_details?.name || null,
-        email: c.billing_details?.email || null,
+        nome: nomeCli,
+        email: emailCli,
         telefone: c.billing_details?.phone || null,
         status: statusStr,
         descricao: c.description || '',
-        subconta: match ? match[1].trim() : '',
-        tipo: classifyTipo(c.description, valor, c.invoice ? 'recorrente' : metodo, 'stripe'),
+        subconta: sub.subconta,
+        subconta_id: sub.subconta_id,
+        subconta_fonte: sub.subconta_fonte,
+        stripe_customer_id: typeof c.customer === 'string' ? c.customer : (c.customer?.id || null),
+        plano: invoiceDesc,
+        tipo: tp.tipo,
+        tipo_fonte: tp.tipo_fonte,
         metodo,
         parcelas,
         link_pagamento: null,
         referencia: null,
         data: new Date(c.created * 1000).toLocaleDateString('pt-BR'),
         data_sort: c.created,
-        previsao_recebimento: calcPrevisaoRecebimento(dataStr, metodo, parcelas, statusStr, 'stripe'),
+        previsao_recebimento: previsaoStripe(bt, dataStr, metodo, parcelas, statusStr),
       };
     });
 
@@ -1157,26 +1542,39 @@ app.get('/api/pagamentos', async (req, res) => {
       const parcelas = parcelasCache[tx.id] || tx.parcelas;
       const statusStr = tx.status === 'disponivel' || tx.status === 'pago' ? 'aprovado' : tx.status === 'cancelado' || tx.status === 'devolvido' ? 'falhou' : tx.status;
       const snd = senderCache[tx.id] || {};
+      const nomePB = limparNome(snd.nome || (tx.nome && tx.nome !== 'N/A' ? tx.nome : null));
+      const emailPB = snd.email || (tx.email && tx.email !== 'N/A' ? tx.email : null);
+      const subPB = resolverSubconta(locIndex, {
+        descricao: nomeLink, nome: nomePB, email: emailPB, txId: tx.id,
+      });
+      const tpPB = resolverTipo({
+        txId: tx.id, email: emailPB, nome: nomePB, descricao: nomeLink,
+        valor: tx.bruto, metodo: tx.metodo, plataforma: 'pagbank',
+        subcontaId: subPB.subconta_id,
+      });
       return {
         id: tx.id,
         plataforma: 'pagbank',
         valor: tx.bruto,
         valor_liquido: tx.liquido,
         taxa: tx.taxa,
-        nome: snd.nome || (tx.nome && tx.nome !== 'N/A' ? tx.nome : null),
-        email: snd.email || (tx.email && tx.email !== 'N/A' ? tx.email : null),
+        nome: nomePB,
+        email: emailPB,
         telefone: snd.telefone || tx.telefone || null,
         status: statusStr,
         descricao: nomeLink || tx.referencia || '',
-        subconta: nomeLink || '',
-        tipo: classifyTipo(nomeLink, tx.bruto, tx.metodo, 'pagbank'),
+        subconta: subPB.subconta,
+        subconta_id: subPB.subconta_id,
+        subconta_fonte: subPB.subconta_fonte,
+        tipo: tpPB.tipo,
+        tipo_fonte: tpPB.tipo_fonte,
         metodo: tx.metodo,
         parcelas,
         link_pagamento: nomeLink,
         referencia: tx.referencia,
         data: tx.data,
         data_sort: new Date(tx.data + 'T12:00:00Z').getTime() / 1000,
-        previsao_recebimento: calcPrevisaoRecebimento(tx.data, tx.metodo, parcelas, statusStr, 'pagbank'),
+        previsao_recebimento: previsaoPagbank(tx, parcelas, statusStr),
       };
     });
 
@@ -1185,88 +1583,363 @@ app.get('/api/pagamentos', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ============================================================================
+// AGENDA DE LIBERACAO — fonte unica de verdade de "quando o dinheiro entra"
+//
+// Stripe : balance_transactions com available_on >= hoje. A soma dos `net`
+//          bate exatamente com balance.pending porque os payouts ja criados
+//          entram como lancamento NEGATIVO de type 'payout' na propria lista.
+//          Nao estimar D+N: o campo available_on e a data exata.
+// PagBank: escrowEndDate, que so existe no endpoint de DETALHE
+//          (/v3/transactions/{code}); a listagem nao traz. liquidation
+//          contractType=FULL => libera o liquido integral nessa data, entao
+//          NAO dividir por installmentCount.
+// ============================================================================
+
+const HOJE_BRT = () => new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString().substring(0, 10);
+const round = (v) => parseFloat((v || 0).toFixed(2));
+
+// O painel carrega varios cards de uma vez e todos precisam da mesma agenda.
+// Sem isso, uma unica abertura da tela varre o PagBank inteiro 4x.
+function comCacheCurto(fn, ttlMs) {
+  let em = 0, valor = null, voando = null;
+  return async (...args) => {
+    if (valor && Date.now() - em < ttlMs) return valor;
+    if (voando) return voando;
+    voando = fn(...args)
+      .then((r) => { valor = r; em = Date.now(); return r; })
+      .finally(() => { voando = null; });
+    return voando;
+  };
+}
+
+// Separa entradas de venda (positivas) das deducoes de payout ja agendado
+// (negativas). Somar tudo num balde so produz dia com valor negativo, que nao
+// significa nada pra quem le. A relacao entre os tres numeros e:
+//     bruto  -  comprometido_em_repasse  =  total (== balance.pending)
+async function stripeAgendaLiberacaoRaw() {
+  const hoje = Math.floor(Date.now() / 1000);
+  const bts = await stripeListAll('balance_transactions', { 'available_on[gte]': String(hoje) });
+
+  const vendas = {}, comprometido = {};
+  let bruto = 0, comp = 0;
+  bts.forEach((bt) => {
+    const data = new Date(bt.available_on * 1000).toISOString().substring(0, 10);
+    const valor = (bt.net || 0) / 100;
+    if (bt.type === 'payout') {
+      comprometido[data] = round((comprometido[data] || 0) + Math.abs(valor));
+      comp += Math.abs(valor);
+    } else {
+      vendas[data] = round((vendas[data] || 0) + valor);
+      bruto += valor;
+    }
+  });
+  const lista = (o) => Object.keys(o).sort().map((d) => ({ data: d, valor: round(o[d]) }));
+  return {
+    total: round(bruto - comp), // == balance.pending
+    total_bruto: round(bruto),
+    total_comprometido: round(comp),
+    por_data: lista(vendas), // so barras positivas — serve pro grafico
+    comprometido_por_data: lista(comprometido),
+  };
+}
+
+// Detalhe de transacao PagBank e imutavel depois de liberada — cache em memoria.
+const pbDetalheCache = new Map();
+
+async function pagbankDetalhe(code) {
+  if (pbDetalheCache.has(code)) return pbDetalheCache.get(code);
+  const r = await pagbankLegacyRequest('/v3/transactions/' + code, {});
+  const xml = r._body || '';
+  if (r._status !== 200 || !xml.includes('<transaction>')) return null;
+  const pm = (xml.match(/<paymentMethod>[\s\S]*?<\/paymentMethod>/) || [''])[0];
+  const senderXml = (xml.match(/<sender>[\s\S]*?<\/sender>/) || [''])[0];
+  const metodoMap = { '1': 'cartao', '2': 'boleto', '3': 'debito', '4': 'saldo', '7': 'pix', '11': 'recorrente' };
+  const escrow = xmlVal(xml, 'escrowEndDate');
+  const det = {
+    id: code,
+    data: (xmlVal(xml, 'date') || '').substring(0, 10),
+    metodo: metodoMap[xmlVal(pm, 'type')] || 'outro',
+    parcelas: parseInt(xmlVal(xml, 'installmentCount') || '1'),
+    liquido: parseFloat(xmlVal(xml, 'netAmount') || '0'),
+    bruto: parseFloat(xmlVal(xml, 'grossAmount') || '0'),
+    // data REAL de liberacao; null quando a transacao ainda nao tem escrow definido
+    data_liberacao: escrow ? escrow.substring(0, 10) : null,
+    nome: senderXml ? xmlVal(senderXml, 'name') : null,
+    email: senderXml ? xmlVal(senderXml, 'email') : null,
+  };
+  pbDetalheCache.set(code, det);
+  return det;
+}
+
+const stripeAgendaLiberacao = comCacheCurto(stripeAgendaLiberacaoRaw, 60000);
+
+async function pagbankAgendaLiberacaoRaw(dias = 120) {
+  const agora = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  const toPS = (d) => {
+    const b = new Date(d.getTime() - 3 * 60 * 60 * 1000);
+    return b.getFullYear() + '-' + pad(b.getMonth() + 1) + '-' + pad(b.getDate()) + 'T' + pad(b.getHours()) + ':' + pad(b.getMinutes());
+  };
+  const txs = await pagbankListAllTx(
+    toPS(new Date(agora.getTime() - dias * 86400000)),
+    toPS(new Date(agora.getTime() - 2 * 60 * 1000))
+  );
+
+  // So quem esta aprovado e ainda nao liberado precisa de detalhe — sao poucos.
+  const aguardando = txs.filter((t) => t.status === 'pago');
+  const detalhes = [];
+  for (let i = 0; i < aguardando.length; i += 6) {
+    const lote = await Promise.all(aguardando.slice(i, i + 6).map((t) => pagbankDetalhe(t.id)));
+    lote.forEach((d, idx) => {
+      const base = aguardando[i + idx];
+      if (d) { detalhes.push(d); return; }
+      // Sem detalhe: cai na heuristica, marcada como estimada
+      const prev = calcPrevisaoRecebimento(base.data, base.metodo, base.parcelas, 'aprovado', 'pagbank');
+      detalhes.push({ ...base, data_liberacao: prev ? prev.data_prevista : null, estimado: true });
+    });
+  }
+
+  const porData = {};
+  let total = 0, estimados = 0;
+  detalhes.forEach((d) => {
+    if (!d.data_liberacao) return;
+    porData[d.data_liberacao] = (porData[d.data_liberacao] || 0) + d.liquido;
+    total += d.liquido;
+    if (d.estimado) estimados++;
+  });
+  return {
+    total: round(total),
+    estimados,
+    itens: detalhes,
+    por_data: Object.keys(porData).sort().map((d) => ({ data: d, valor: round(porData[d]) })),
+  };
+}
+
+const pagbankAgendaLiberacao = comCacheCurto(pagbankAgendaLiberacaoRaw, 60000);
+
 // GET /api/projecao/recebimento — projecao unificada Stripe+PagBank por data de recebimento
 app.get('/api/projecao/recebimento', async (req, res) => {
   try {
-    // Busca os ultimos 90 dias para capturar todos os pagamentos pendentes de liquidacao
-    const agora = new Date();
-    const inicioUnix = Math.floor((agora.getTime() - 90 * 24 * 60 * 60 * 1000) / 1000);
-    const fimUnix = Math.floor(agora.getTime() / 1000);
-    const fakeReq = { query: { start: String(inicioUnix), end: String(fimUnix) } };
-
-    const { inicio, fim } = getPeriodo(fakeReq);
-    const { inicio: inicioPB, fim: fimPB } = getPeriodoPagbank(fakeReq);
-
-    // Data de hoje em BRT (UTC-3) para filtrar somente datas futuras no grafico
-    const brtNow = new Date(agora.getTime() - 3 * 60 * 60 * 1000);
-    const todayStr = brtNow.toISOString().substring(0, 10); // YYYY-MM-DD
-
-    const [stripeBalance, charges, txsPagbank] = await Promise.all([
-      // Balance API = fonte da verdade para stripe_pendente (total real a receber)
-      stripeRequest('/v1/balance'),
-      stripeListAll('charges', {
-        'created[gte]': String(inicio), 'created[lte]': String(fim),
-        'expand[]': 'data.balance_transaction',
-      }),
-      pagbankListAllTx(inicioPB, fimPB),
+    const hoje = HOJE_BRT();
+    const [stripeAg, pagbankAg] = await Promise.all([
+      stripeAgendaLiberacao(),
+      pagbankAgendaLiberacao(),
     ]);
 
-    // stripe_pendente = saldo pending oficial da Stripe (bate com card "A liberar")
-    const stripe_pendente = parseFloat(
-      ((stripeBalance.pending || []).reduce((s, b) => s + b.amount, 0) / 100).toFixed(2)
-    );
-
-    // Enriquecer PagBank com senderCache e parcelasCache
-    const refMap = {}; txsPagbank.forEach(tx => { if (tx.referencia && !refMap[tx.referencia]) refMap[tx.referencia] = tx.id; });
-    await Promise.all(Object.entries(refMap).map(([ref, code2]) => fetchLinkNome(ref, code2)));
-
-    // Acumular por data_prevista (somente datas futuras — hoje exclusive)
+    // O grafico mostra o BRUTO que libera em cada dia (barras sempre positivas).
+    // Ele nao fecha com stripe_pendente porque parte desse dinheiro ja foi
+    // comprometida num repasse — a diferenca vai explicita em `reconciliacao`,
+    // em vez de virar barra negativa ou contradicao silenciosa com o card.
+    // Datas ja vencidas entram tambem (PagBank aprovado que passou da
+    // escrowEndDate e ainda nao virou disponivel) — sinalizadas com `atrasado`.
     const byDate = {};
-    const addEntry = (date, stripe, pagbank) => {
-      if (date <= todayStr) return; // ignorar datas de hoje ou passadas no grafico
-      if (!byDate[date]) byDate[date] = { data: date, stripe: 0, pagbank: 0, total: 0 };
-      byDate[date].stripe = parseFloat((byDate[date].stripe + stripe).toFixed(2));
-      byDate[date].pagbank = parseFloat((byDate[date].pagbank + pagbank).toFixed(2));
-      byDate[date].total = parseFloat((byDate[date].stripe + byDate[date].pagbank).toFixed(2));
+    const addEntry = (data, stripe, pagbank) => {
+      if (!byDate[data]) byDate[data] = { data, stripe: 0, pagbank: 0, total: 0 };
+      byDate[data].stripe = round(byDate[data].stripe + stripe);
+      byDate[data].pagbank = round(byDate[data].pagbank + pagbank);
+      byDate[data].total = round(byDate[data].stripe + byDate[data].pagbank);
     };
+    stripeAg.por_data.forEach((d) => addEntry(d.data, d.valor, 0));
+    pagbankAg.por_data.forEach((d) => addEntry(d.data, 0, d.valor));
 
-    // Stripe — bt.available_on como data exata; bt.status='pending' = nao liquidado ainda
-    charges.forEach(c => {
-      if (c.status !== 'succeeded') return;
-      const bt = c.balance_transaction && typeof c.balance_transaction === 'object' ? c.balance_transaction : null;
-      if (!bt || bt.status !== 'pending') return;
-      const liquido = (bt.net || 0) / 100;
-      const availableOn = new Date(bt.available_on * 1000).toISOString().substring(0, 10);
-      addEntry(availableOn, liquido, 0);
-    });
-
-    // PagBank — status 'pago' = aprovado mas ainda nao creditado ao vendedor
-    let pagbank_pendente_calc = 0;
-    txsPagbank.forEach(tx => {
-      if (tx.status !== 'pago') return;
-      const parcelas = parcelasCache[tx.id] || tx.parcelas;
-      const prev = calcPrevisaoRecebimento(tx.data, tx.metodo, parcelas, 'aprovado', 'pagbank');
-      const valor = tx.liquido || tx.bruto;
-      pagbank_pendente_calc += valor;
-      if (prev) addEntry(prev.data_prevista, 0, valor);
-    });
-    const pagbank_pendente = parseFloat(pagbank_pendente_calc.toFixed(2));
-
-    // Ordenar por data e formatar para o frontend
     const projecao = Object.values(byDate)
       .sort((a, b) => a.data.localeCompare(b.data))
-      .map(d => ({
+      .map((d) => ({
         ...d,
         data_br: d.data.split('-').reverse().join('/'), // DD/MM/YYYY
+        atrasado: d.data < hoje,
       }));
 
     res.json({
       projecao,
-      // Totais usam fontes oficiais (Balance API Stripe + status PagBank)
-      // garantindo coerencia com os cards de "A liberar" em toda plataforma
-      stripe_pendente,
-      pagbank_pendente,
-      total_pendente: parseFloat((stripe_pendente + pagbank_pendente).toFixed(2)),
+      stripe_pendente: stripeAg.total,
+      pagbank_pendente: pagbankAg.total,
+      total_pendente: round(stripeAg.total + pagbankAg.total),
+      hoje,
+      // Por que a soma das barras da Stripe e maior que stripe_pendente:
+      reconciliacao: {
+        stripe_bruto_a_liberar: stripeAg.total_bruto,
+        stripe_comprometido_em_repasse: stripeAg.total_comprometido,
+        stripe_pendente_liquido: stripeAg.total,
+        explicacao: 'bruto - comprometido_em_repasse = pendente_liquido; o comprometido ja virou repasse com data de chegada propria',
+        repasses_a_caminho: stripeAg.comprometido_por_data.map((d) => ({ ...d, data_br: d.data.split('-').reverse().join('/') })),
+      },
+      fonte: {
+        stripe: 'balance_transactions.available_on',
+        pagbank: 'escrowEndDate (detalhe da transacao)',
+      },
+      // quantas transacoes PagBank cairam na heuristica por falta de escrowEndDate
+      pagbank_estimados: pagbankAg.estimados,
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Payouts Stripe a caminho do banco (estagio 2). O filtro ?status= da API nao e
+// confiavel aqui, entao busca por janela e filtra em memoria.
+async function stripePayoutsEmRota() {
+  const desde = Math.floor(Date.now() / 1000) - 30 * 86400;
+  const payouts = await stripeListAll('payouts', { 'created[gte]': String(desde) });
+  return payouts
+    .filter((p) => p.status === 'pending' || p.status === 'in_transit')
+    .map((p) => {
+      const data = new Date(p.arrival_date * 1000).toISOString().substring(0, 10);
+      return {
+        plataforma: 'stripe',
+        id: p.id,
+        valor: round((p.amount || 0) / 100),
+        data_chegada: data,
+        data_chegada_br: data.split('-').reverse().join('/'),
+        status: p.status, // 'pending' = agendado, 'in_transit' = ja saiu
+        destino: p.destination || null,
+      };
+    })
+    .sort((a, b) => a.data_chegada.localeCompare(b.data_chegada));
+}
+
+// GET /api/recebimentos/estagios — separa o dinheiro nos 3 estagios reais
+// 1) liberando na plataforma  2) em transito pro banco  3) ja recebido
+app.get('/api/recebimentos/estagios', async (req, res) => {
+  try {
+    const hoje = HOJE_BRT();
+    const { inicio, fim } = getPeriodo(req);
+
+    const [stripeAg, pagbankAg, saldo, emRota, payoutsPagos] = await Promise.all([
+      stripeAgendaLiberacao(),
+      pagbankAgendaLiberacao(),
+      stripeRequest('/v1/balance'),
+      stripePayoutsEmRota(),
+      stripeListAll('payouts', { 'arrival_date[gte]': String(inicio), 'arrival_date[lte]': String(fim) }),
+    ]);
+
+    // --- estagio 1: liberando (ainda nao disponivel) ---
+    const byDate = {};
+    const add = (data, s, p) => {
+      if (!byDate[data]) byDate[data] = { data, stripe: 0, pagbank: 0, total: 0 };
+      byDate[data].stripe = round(byDate[data].stripe + s);
+      byDate[data].pagbank = round(byDate[data].pagbank + p);
+      byDate[data].total = round(byDate[data].stripe + byDate[data].pagbank);
+    };
+    stripeAg.por_data.forEach((d) => add(d.data, d.valor, 0));
+    pagbankAg.por_data.forEach((d) => add(d.data, 0, d.valor));
+    const porData = Object.values(byDate)
+      .sort((a, b) => a.data.localeCompare(b.data))
+      .map((d) => ({ ...d, data_br: d.data.split('-').reverse().join('/'), atrasado: d.data < hoje }));
+
+    // --- estagio 2: em transito (data de chegada exata) ---
+    const totalEmRota = round(emRota.reduce((a, p) => a + p.valor, 0));
+
+    // --- estagio 3: ja caiu no banco, dentro do periodo filtrado ---
+    const recebidos = payoutsPagos
+      .filter((p) => p.status === 'paid')
+      .map((p) => {
+        const data = new Date(p.arrival_date * 1000).toISOString().substring(0, 10);
+        return { plataforma: 'stripe', id: p.id, valor: round((p.amount || 0) / 100), data_chegada: data, data_chegada_br: data.split('-').reverse().join('/') };
+      })
+      .sort((a, b) => b.data_chegada.localeCompare(a.data_chegada));
+
+    const disponivelStripe = round(((saldo.available || []).reduce((s, b) => s + b.amount, 0)) / 100);
+
+    res.json({
+      hoje,
+      liberando: {
+        total: round(stripeAg.total + pagbankAg.total),
+        stripe: stripeAg.total,
+        pagbank: pagbankAg.total,
+        // por_data e BRUTO: parte do valor da Stripe ja esta comprometida no
+        // estagio 2, por isso a soma das barras > liberando.stripe
+        por_data: porData,
+        stripe_bruto: stripeAg.total_bruto,
+        stripe_comprometido_em_repasse: stripeAg.total_comprometido,
+      },
+      em_transito: {
+        total: totalEmRota,
+        stripe: totalEmRota,
+        // PagBank nao expoe repasse pro banco nesta credencial (403 em /accounts/balance)
+        pagbank: null,
+        pagbank_nota: 'PagBank nao expoe repasses ao banco com o token atual',
+        itens: emRota,
+        proxima_chegada: emRota[0] || null,
+      },
+      disponivel: {
+        stripe: disponivelStripe,
+        pagbank: null,
+        pagbank_nota: 'saldo PagBank indisponivel — /accounts/balance nega o token atual',
+      },
+      recebido: {
+        total: round(recebidos.reduce((a, p) => a + p.valor, 0)),
+        itens: recebidos,
+        periodo: { inicio, fim },
+      },
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/fluxo-caixa?dias=30 — calendario unificado: quanto entra por dia
+app.get('/api/fluxo-caixa', async (req, res) => {
+  try {
+    const dias = Math.min(Math.max(parseInt(req.query.dias || '30', 10) || 30, 1), 180);
+    const hoje = HOJE_BRT();
+    const limite = new Date(new Date(hoje).getTime() + dias * 86400000).toISOString().substring(0, 10);
+
+    const [stripeAg, pagbankAg, chg] = await Promise.all([
+      stripeAgendaLiberacao(),
+      pagbankAgendaLiberacao(),
+      stripeChegadasNoBanco(),
+    ]);
+
+    const dd = {};
+    const slot = (data) => {
+      if (!dd[data]) dd[data] = { data, stripe_liberando: 0, pagbank_liberando: 0, chegando_no_banco: 0, chegando_confirmado: 0, chegando_projetado: 0 };
+      return dd[data];
+    };
+    stripeAg.por_data.forEach((d) => { if (d.data <= limite) slot(d.data).stripe_liberando = round(d.valor); });
+    pagbankAg.por_data.forEach((d) => { if (d.data <= limite) slot(d.data).pagbank_liberando = round(d.valor); });
+    // chegada no banco = repasse confirmado + saldo que ainda vira repasse.
+    // Antes so os payouts ja criados entravam, entao o calendario mostrava R$ 0
+    // em dias que a propria Stripe ja anunciava recebimento.
+    chg.chegadas.forEach((c) => {
+      if (c.data > limite) return;
+      const sl = slot(c.data);
+      sl.chegando_no_banco = round(sl.chegando_no_banco + c.valor);
+      sl.chegando_confirmado = round((sl.chegando_confirmado || 0) + c.confirmado);
+      sl.chegando_projetado = round((sl.chegando_projetado || 0) + c.projetado);
+    });
+
+    const SEM = ['dom', 'seg', 'ter', 'qua', 'qui', 'sex', 'sab'];
+    let acumulado = 0;
+    const calendario = Object.values(dd)
+      .sort((a, b) => a.data.localeCompare(b.data))
+      .map((d) => {
+        const liberando = round(d.stripe_liberando + d.pagbank_liberando);
+        acumulado = round(acumulado + liberando);
+        return {
+          ...d,
+          data_br: d.data.split('-').reverse().join('/'),
+          dia_semana: SEM[new Date(d.data + 'T12:00:00Z').getUTCDay()],
+          total_liberando: liberando,
+          acumulado,
+          atrasado: d.data < hoje,
+        };
+      });
+
+    const ate = (n) => {
+      const lim = new Date(new Date(hoje).getTime() + n * 86400000).toISOString().substring(0, 10);
+      return round(calendario.filter((d) => d.data <= lim).reduce((a, d) => a + d.total_liberando, 0));
+    };
+
+    res.json({
+      hoje,
+      dias,
+      calendario,
+      resumo: {
+        ate_7_dias: ate(7),
+        ate_15_dias: ate(15),
+        ate_30_dias: ate(30),
+        total_periodo: round(calendario.reduce((a, d) => a + d.total_liberando, 0)),
+        chegando_no_banco: chg.total,
+        chegando_no_banco_confirmado: chg.total_confirmado,
+      },
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -1287,34 +1960,6 @@ app.get('/api/pagbank/debug', async (req, res) => {
         r.on('data', (chunk) => (data += chunk));
         r.on('end', () => resolve({ _body: data, _status: r.statusCode }));
       });
-
-// GET /api/pagbank/raw-tx — debug: retorna XML bruto para verificar campos
-app.get('/api/pagbank/raw-tx', async (req, res) => {
-  try {
-    const agora = new Date();
-    const brt = (d) => new Date(d.getTime() - 3 * 60 * 60 * 1000);
-    const pad = (n) => String(n).padStart(2, '0');
-    const toPS = (d) => { const b = brt(d); return b.getFullYear() + '-' + pad(b.getMonth()+1) + '-' + pad(b.getDate()) + 'T' + pad(b.getHours()) + ':' + pad(b.getMinutes()); };
-    const fim = new Date(agora.getTime() - 2 * 60 * 1000);
-    const inicio = new Date(agora.getTime() - 35 * 24 * 60 * 60 * 1000);
-    const result = await pagbankLegacyRequest('/v3/transactions', {
-      initialDate: toPS(inicio), finalDate: toPS(fim), maxPageResults: 3, page: 1,
-    });
-    const txXmls = xmlAll(result._body, 'transaction');
-    const firstTx = txXmls[0] || '';
-    const installMatch = firstTx.match(/<installmentCount[^>]*>[\s\S]*?<\/installmentCount>/);
-    const pmMatch2 = firstTx.match(/<paymentMethod[^>]*>[\s\S]*?<\/paymentMethod>/);
-    const senderMatch2 = firstTx.match(/<sender[^>]*>[\s\S]*?<\/sender>/);
-    res.json({
-      status: result._status,
-      total_txs: txXmls.length,
-      installmentCount_tag: installMatch ? installMatch[0] : 'NOT FOUND IN XML',
-      paymentMethod: pmMatch2 ? pmMatch2[0] : 'NOT FOUND',
-      sender: senderMatch2 ? senderMatch2[0] : 'NOT FOUND',
-      tx_snippet: firstTx.substring(0, 600),
-    });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
       req.on('error', reject);
       req.end();
     });
@@ -1486,10 +2131,12 @@ async function ghlGetAllLocations() {
 // Normaliza nomes para comparacao fuzzy (remove acentos, espacos extras, case)
 function normalizeName(str) {
   if (!str) return '';
+  // Atencao: as classes precisam do \s escapado. Sem a barra, [^a-z0-9s] apaga
+  // a letra "s" do nome ("Castilho Seguros" virava "ca tilho eguro").
   return str.toLowerCase()
     .normalize('NFD').replace(/[̀-ͯ]/g, '') // remove acentos
-    .replace(/[^a-z0-9s]/g, '')                      // remove especiais
-    .replace(/s+/g, ' ').trim();
+    .replace(/[^a-z0-9\s]/g, ' ')                     // especiais viram espaco
+    .replace(/\s+/g, ' ').trim();
 }
 
 // Verifica se dois nomes sao suficientemente similares
@@ -1643,7 +2290,7 @@ app.get('/api/ghl/cruzamento', async (req, res) => {
 // quando o match automatico por nome nao funciona
 // ============================================================
 
-const MAPPINGS_FILE = '/tmp/ghl_stripe_mappings.json';
+const MAPPINGS_FILE = dataFile('ghl_stripe_mappings.json');
 
 // Carrega mapeamentos do arquivo (persiste entre restarts)
 function loadMappings() {
@@ -1812,6 +2459,9 @@ app.get('/api/pagbank/transacoes/recentes', async (req, res) => {
     await Promise.all(Object.entries(refMap).map(([ref, code]) => fetchLinkNome(ref, code)));
     await ensureSenderData(txs);
 
+    // aquece o cache de detalhes para previsao_recebimento sair com data real
+    await pagbankAgendaLiberacao().catch(() => {});
+
     const recentes = txs.slice(0, limit).map(tx => {
       const sender = senderCache[tx.id] || {};
       const parcelas = parcelasCache[tx.id] || tx.parcelas;
@@ -1830,7 +2480,7 @@ app.get('/api/pagbank/transacoes/recentes', async (req, res) => {
         status_label: statusStr,
         bruto: tx.bruto,
         liquido: tx.liquido,
-        previsao_recebimento: calcPrevisaoRecebimento(tx.data, tx.metodo, parcelas, statusStr, 'pagbank'),
+        previsao_recebimento: previsaoPagbank(tx, parcelas, statusStr),
       };
     });
 
@@ -1938,24 +2588,19 @@ app.get('/api/dashboard/resumo', async (req, res) => {
         }
       }
 
-      // p_a_receber e pipeline: sempre últimos 60 dias (independente do filtro de período)
-      // Garante que o card "A Receber" mostra o saldo pendente real, não filtrado por data
-      const agoraBRT = new Date(new Date().getTime() - 3 * 60 * 60 * 1000);
-      const inicio60BRT = new Date(agoraBRT.getTime() - 60 * 24 * 60 * 60 * 1000);
-      const toBRTStr = (d) => {
-        const pad = n => String(n).padStart(2, '0');
-        return d.getUTCFullYear() + '-' + pad(d.getUTCMonth()+1) + '-' + pad(d.getUTCDate()) + 'T' + pad(d.getUTCHours()) + ':' + pad(d.getUTCMinutes());
-      };
-      const txsPendentes = await pagbankListAllTx(toBRTStr(inicio60BRT), toBRTStr(agoraBRT));
-      for (const tx of txsPendentes) {
-        if (tx.status === 'pago') {
-          p_a_receber += tx.liquido;
-          const m = tx.metodo || 'cartao';
-          if (m === 'pix') pipeline.pix += tx.liquido;
-          else if (m === 'boleto') pipeline.boleto += tx.liquido;
-          else if (m === 'debito') pipeline.debito += tx.liquido;
-          else pipeline.cartao += tx.liquido;
-        }
+      // p_a_receber e pipeline vem da MESMA agenda de liberacao usada no resto
+      // do painel (escrowEndDate). Antes era uma varredura propria de 60 dias:
+      // dava o mesmo numero por sorte, mas perderia uma venda no cartao (D+30)
+      // feita ha mais de 60 dias e ainda nao liberada.
+      const agPB = await pagbankAgendaLiberacao();
+      p_a_receber = agPB.total;
+      for (const it of agPB.itens) {
+        if (!it.data_liberacao) continue;
+        const m = it.metodo || 'cartao';
+        if (m === 'pix') pipeline.pix += it.liquido;
+        else if (m === 'boleto') pipeline.boleto += it.liquido;
+        else if (m === 'debito') pipeline.debito += it.liquido;
+        else pipeline.cartao += it.liquido;
       }
     }
 
@@ -2165,7 +2810,7 @@ app.get('/api/stripe/ltv', async (req, res) => {
 // ═══════════════════════════════════════════════════════════
 
 // Historico NF — persistido em JSON para sobreviver restarts/deploys
-const NF_DATA_FILE = path.join(__dirname, 'nf-data.json');
+const NF_DATA_FILE = dataFile('nf-data.json');
 let nfHistorico = [];             // todos os registros (compat. retroativa)
 let nfPorMes    = {};             // { "2026-04": [...] }
 
@@ -2199,7 +2844,7 @@ loadNfData();
 // status de implementação e NF por cliente (GHL location ID)
 // ============================================================
 
-const GESTAO_FILE = path.join(__dirname, 'clientes-gestao.json');
+const GESTAO_FILE = dataFile('clientes-gestao.json');
 let clientesGestaoData = {};
 
 function loadGestaoData() {
@@ -3099,8 +3744,8 @@ app.get('/api/clientes/:customerId/historico', async (req, res) => {
 // AGENTE ANALISTA FINANCEIRO — powered by Claude AI
 // ═══════════════════════════════════════════════════════════════════════════
 
-const ANALISE_DATA_FILE     = path.join(__dirname, 'analise-financeira.json');
-const CONHECIMENTO_FIN_FILE = path.join(__dirname, 'conhecimento-financeiro.json');
+const ANALISE_DATA_FILE     = dataFile('analise-financeira.json');
+const CONHECIMENTO_FIN_FILE = dataFile('conhecimento-financeiro.json');
 
 let analisesHistorico = [];
 let conhecimentoFin   = {};

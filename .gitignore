@@ -1,3 +1,4 @@
 node_modules/
 nf-data.json
 .env
+data/
