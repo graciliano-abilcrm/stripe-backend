@@ -4722,6 +4722,7 @@ app.post('/api/clientes/gestao/importar', (req, res) => {
   res.json({ ok: true, total: Object.keys(clientesGestaoData).length });
 });
 
+require('./cs-portfolio.cjs').register(app,stripeListAll,()=>manualMappings);
 app.listen(PORT, () => {
   console.log(`Stripe API backend rodando na porta ${PORT}`);
 });
